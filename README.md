@@ -1,6 +1,6 @@
 # Sampling Proxy
 
-A middleware server that intercepts and modifies sampling parameters for generation requests to OpenAI-compatible backends. It supports both OpenAI-compatible and Anthropic request formats, allowing you to override default sampling parameters for different models.
+A middleware server that intercepts and modifies sampling parameters for generation requests to OpenAI-compatible backends. It allows overriding specific parameters per model name when they are not set in the request, or enforcing parameter overrides when they are set in the request. The server supports both OpenAI-compatible and Anthropic request formats, enabling the use of Claude Code with OpenAI-compatible backends.
 
 ## Features
 
@@ -67,13 +67,14 @@ python sampling-proxy.py --help
 ```
 
 Available options:
-- `--host`: Host address for the proxy server (default: 0.0.0.0)
-- `--port`: Port for the proxy server (default: 8001)
-- `--target-host`: Host address for the backend (default: 127.0.0.1)
-- `--target-port`: Port for the backend (default: 8000)
-- `--debug-logs, -d`: Enable detailed debug logging
-- `--override-logs, -o`: Show when sampling parameters are overridden
-- `--enforce-params, -e`: Enforce specific parameters as JSON string
+- `--config, -c`: Path to configuration JSON file (default: config.json)
+- `--host`: Host address for the proxy server (overrides config)
+- `--port`: Port for the proxy server (overrides config)
+- `--target-host`: Host address for the backend (overrides config)
+- `--target-port`: Port for the backend (overrides config)
+- `--debug-logs, -d`: Enable detailed debug logging (overrides config)
+- `--override-logs, -o`: Show when sampling parameters are overridden (overrides config)
+- `--enforce-params, -e`: Enforce specific parameters as JSON string (overrides config)
 
 ### Examples
 
@@ -82,12 +83,17 @@ Available options:
    python sampling-proxy.py --port 8080 --target-port 8081 --debug-logs
    ```
 
-2. **Run with enforced parameters**:
+2. **Run with a custom configuration file**:
+   ```bash
+   python sampling-proxy.py --config my-config.json
+   ```
+
+3. **Run with enforced parameters**:
    ```bash
    python sampling-proxy.py --enforce-params '{"temperature": 0.7, "top_p": 0.9}'
    ```
 
-3. **Run with override logs to see parameter changes**:
+4. **Run with override logs to see parameter changes**:
    ```bash
    python sampling-proxy.py --override-logs
    ```
@@ -111,50 +117,35 @@ python sampling-proxy.py
 
 ## Configuration
 
-### Sampling Parameters
+The proxy uses an external `config.json` file for configuration. You can specify a custom config file path with the `--config` command-line argument.
 
-The proxy applies sampling parameters in the following priority order:
+### Configuration Fields
 
-1. **Enforced Parameters** (highest priority - always override)
-2. **Request Parameters** (parameters sent in the request)
-3. **Model-Specific Parameters** (configured per model)
-4. **Default Parameters** (fallback values)
+- **server**: Network and timeout settings
+  - `target_host`: Backend server host (default: "127.0.0.1")
+  - `target_port`: Backend server port (default: "8000")
+  - `sampling_proxy_host`: Proxy server host (default: "0.0.0.0")
+  - `sampling_proxy_port`: Proxy server port (default: 8001)
+  - `timeout_seconds`: HTTP request timeout in seconds (default: 1200.0)
 
-### Customizing Parameters
+- **logging**: Debug and logging options
+  - `enable_debug_logs`: Enable detailed debug logging (default: false)
+  - `enable_override_logs`: Show parameter override logs (default: false)
 
-Edit the `sampling-proxy.py` file to modify:
+- **default_sampling_params**: Fallback parameters applied when not specified in request
+- **enforced_sampling_params**: Parameters that always override incoming values
+- **model_sampling_params**: Model-specific parameter configurations
 
-1. **Default Parameters**:
-   ```python
-   DEFAULT_SAMPLING_PARAMS = {
-       "top_p": 0.95,
-       "min_p": 0.05,
-       "top_k": 40,
-       "repetition_penalty": 1.05,
-       "temperature": 0.6,
-   }
-   ```
+**Note**: Set parameter values to `null` to disable them (they will be filtered out).
 
-2. **Model-Specific Parameters**:
-   ```python
-   MODEL_SAMPLING_PARAMS = {
-       "your-model-name": {
-           "temperature": 0.15,
-           "top_p": 0.95,
-           "repetition_penalty": 1.0,
-           "top_k": 40,
-           "min_p": 0.01,
-       },
-   }
-   ```
+### Sampling Parameter Priority
 
-3. **Enforced Parameters** (always override):
-   ```python
-   ENFORCED_SAMPLING_PARAMS = {
-       "temperature": 0.7,
-       "top_p": 0.9,
-   }
-   ```
+The proxy applies sampling parameters in the following priority order (from highest to lowest):
+
+1. **Enforced sampling parameters** (always override everything)
+2. **Parameters specified in the request**
+3. **Model-specific sampling parameters**
+4. **Default sampling parameters** (fallback values)
 
 ## API Endpoints
 
