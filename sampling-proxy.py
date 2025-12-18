@@ -25,11 +25,12 @@ ENABLE_OVERRIDE_LOGS = False
 # These values will be used if no model-specific override is found and
 # the parameter is missing from the incoming generation request.
 DEFAULT_SAMPLING_PARAMS = {
-    "top_p": 0.95,
-    "min_p": 0.05,
-    "top_k": 40,
-    "repetition_penalty": 1.05,
-    "temperature": 0.6,
+    # Example: Uncomment and modify to use default parameters as a fallback
+    # "top_p": 0.95,
+    # "min_p": 0.05,
+    # "top_k": 40,
+    # "repetition_penalty": 1.05,
+    # "temperature": 0.8,
 }
 # Enforced sampling parameters - these will ALWAYS override incoming parameters
 # Set to empty dict {} to disable enforcement (default behavior)
@@ -48,9 +49,11 @@ DEFAULT_SAMPLING_PARAMS = {
 # - To disable enforcement completely: {}
 ENFORCED_SAMPLING_PARAMS = {
     # Example: Uncomment and modify to enforce specific parameters
-    # "temperature": 0.7,
-    # "top_p": 0.9,
-    # "top_k": 50,
+    # "top_p": 0.95,
+    # "temperature": 0.8,
+    # "repetition_penalty": 1.05,
+    # "top_k": 40,
+    # "min_p": 0.0,
 }
 
 # Model-specific sampling parameters
@@ -58,17 +61,13 @@ ENFORCED_SAMPLING_PARAMS = {
 # If a parameter is not present here for a given model, the DEFAULT_SAMPLING_PARAMS
 # will be used as a fallback.
 MODEL_SAMPLING_PARAMS = {
-    "/home/ubuntu/models/Autoround/Devstral-Small-2507-mistralai-w8g128": {
-        "top_p": 0.95,
-        "temperature": 0.15,
-        "repetition_penalty": 1.0,
-        "top_k": 40,
-        "min_p": 0.01,
-    },
-    # Add more models and their specific parameters here, e.g.:
+    # Add models and their specific parameters here, e.g.:
     # "your-custom-model": {
-    #     "temperature": 0.9,
-    #     "top_p": 0.85,
+    #    "top_p": 0.95,
+    #    "temperature": 0.8,
+    #    "repetition_penalty": 1.05,
+    #    "top_k": 40,
+    #    "min_p": 0.0,
     # },
 }
 
