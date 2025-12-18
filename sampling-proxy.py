@@ -8,68 +8,94 @@ import uvicorn
 import asyncio # Import asyncio for potential sleep
 import argparse # Import argparse for command-line arguments
 
+def load_config(config_path="config.json"):
+    """
+    Load configuration from JSON file.
+    Returns a dictionary with configuration values.
+    If config file doesn't exist or is invalid, returns default values.
+    """
+    default_config = {
+        "server": {
+            "target_host": "127.0.0.1",
+            "target_port": "8000",
+            "sampling_proxy_host": "0.0.0.0",
+            "sampling_proxy_port": 8001,
+            "timeout_seconds": 1200.0
+        },
+        "logging": {
+            "enable_debug_logs": False,
+            "enable_override_logs": False
+        },
+        "default_sampling_params": {},
+        "enforced_sampling_params": {},
+        "model_sampling_params": {}
+    }
+    
+    if not os.path.exists(config_path):
+        print(f"WARNING: Config file '{config_path}' not found. Using default values.")
+        return default_config
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # Merge with defaults to ensure all required keys exist
+        merged_config = default_config.copy()
+        for key, value in config.items():
+            if key in merged_config:
+                if isinstance(merged_config[key], dict) and isinstance(value, dict):
+                    merged_config[key].update(value)
+                else:
+                    merged_config[key] = value
+            else:
+                merged_config[key] = value
+        
+        # Filter out null values from sampling params (convert to empty dicts)
+        if merged_config.get("default_sampling_params"):
+            merged_config["default_sampling_params"] = {
+                k: v for k, v in merged_config["default_sampling_params"].items()
+                if v is not None
+            }
+        
+        if merged_config.get("enforced_sampling_params"):
+            merged_config["enforced_sampling_params"] = {
+                k: v for k, v in merged_config["enforced_sampling_params"].items()
+                if v is not None
+            }
+        
+        if merged_config.get("model_sampling_params"):
+            filtered_model_params = {}
+            for model, params in merged_config["model_sampling_params"].items():
+                filtered_params = {
+                    k: v for k, v in params.items()
+                    if v is not None
+                }
+                if filtered_params:  # Only include models with non-null params
+                    filtered_model_params[model] = filtered_params
+            merged_config["model_sampling_params"] = filtered_model_params
+        
+        print(f"Configuration loaded from '{config_path}'")
+        return merged_config
+        
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON in config file '{config_path}': {e}. Using default values.")
+        return default_config
+    except Exception as e:
+        print(f"ERROR: Error loading config file '{config_path}': {e}. Using default values.")
+        return default_config
+
 # --- Configuration ---
-# OpenAI Compatible backend server address and port
-TARGET_HOST = os.getenv("TARGET_HOST", "127.0.0.1")
-TARGET_PORT = os.getenv("TARGET_PORT", "8000")
-TARGET_BASE_URL = f"http://{TARGET_HOST}:{TARGET_PORT}"
-
-# Middleware server address and port
-SAMPLING_PROXY_HOST = os.getenv("SAMPLING_PROXY_HOST", "0.0.0.0")
-SAMPLING_PROXY_PORT = int(os.getenv("SAMPLING_PROXY_PORT", "8001"))
-
+# These will be initialized in the main block after loading config
+TARGET_HOST = None
+TARGET_PORT = None
+TARGET_BASE_URL = None
+SAMPLING_PROXY_HOST = None
+SAMPLING_PROXY_PORT = None
 ENABLE_DEBUG_LOGS = False
 ENABLE_OVERRIDE_LOGS = False
-
-# Default sampling parameters to apply if not specified in the request
-# These values will be used if no model-specific override is found and
-# the parameter is missing from the incoming generation request.
-DEFAULT_SAMPLING_PARAMS = {
-    # Example: Uncomment and modify to use default parameters as a fallback
-    # "top_p": 0.95,
-    # "min_p": 0.05,
-    # "top_k": 40,
-    # "repetition_penalty": 1.05,
-    # "temperature": 0.8,
-}
-# Enforced sampling parameters - these will ALWAYS override incoming parameters
-# Set to empty dict {} to disable enforcement (default behavior)
-# Any parameters specified here will override both incoming request parameters
-# and model-specific defaults for ALL requests
-#
-# Priority order (highest to lowest):
-# 1. ENFORCED_SAMPLING_PARAMS (always applied, overrides everything)
-# 2. Parameters present in incoming request (kept as-is if not enforced)
-# 3. MODEL_SAMPLING_PARAMS (applied if parameter missing from request and not enforced)
-# 4. DEFAULT_SAMPLING_PARAMS (applied if parameter missing from request and not in model-specific)
-#
-# Usage examples:
-# - To enforce temperature to 0.7 regardless of what client sends: {"temperature": 0.7}
-# - To enforce multiple parameters: {"temperature": 0.7, "top_p": 0.9, "top_k": 50}
-# - To disable enforcement completely: {}
-ENFORCED_SAMPLING_PARAMS = {
-    # Example: Uncomment and modify to enforce specific parameters
-    # "top_p": 0.95,
-    # "temperature": 0.8,
-    # "repetition_penalty": 1.05,
-    # "top_k": 40,
-    # "min_p": 0.0,
-}
-
-# Model-specific sampling parameters
-# You can customize this dictionary to set specific parameters for different models.
-# If a parameter is not present here for a given model, the DEFAULT_SAMPLING_PARAMS
-# will be used as a fallback.
-MODEL_SAMPLING_PARAMS = {
-    # Add models and their specific parameters here, e.g.:
-    # "your-custom-model": {
-    #    "top_p": 0.95,
-    #    "temperature": 0.8,
-    #    "repetition_penalty": 1.05,
-    #    "top_k": 40,
-    #    "min_p": 0.0,
-    # },
-}
+DEFAULT_SAMPLING_PARAMS = {}
+ENFORCED_SAMPLING_PARAMS = {}
+MODEL_SAMPLING_PARAMS = {}
 
 # List of API paths that are considered "generation" endpoints.
 # Note: Paths here should NOT have leading/trailing slashes for direct comparison
@@ -85,13 +111,14 @@ ANTHROPIC_ENDPOINTS = [
     "api/event_logging/batch",  # Anthropic event logging endpoint
 ]
 
+# Global variable to store the first available model name from /v1/models
+FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
+
 # Initialize an httpx AsyncClient for making requests to the OpenAI Compatible backend.
 # This client is designed for efficient connection pooling.
 # A higher timeout is set to accommodate potentially long LLM generation times.
-client = httpx.AsyncClient(base_url=TARGET_BASE_URL, timeout=1200.0)
-
-# Global variable to store the first available model name from /v1/models
-FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
+# Note: This will be re-initialized after config loading in the main block
+client = None
 
 # --- FastAPI Application Lifespan Setup ---
 @asynccontextmanager
@@ -100,8 +127,12 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events for the FastAPI application.
     Ensures the httpx client is properly closed when the application shuts down.
     """
-    global FIRST_AVAILABLE_MODEL
+    global FIRST_AVAILABLE_MODEL, client
     print("FastAPI application startup.")
+    
+    # Initialize client with the correct TARGET_BASE_URL and timeout from config
+    timeout_seconds = CONFIG["server"].get("timeout_seconds", 1200.0)
+    client = httpx.AsyncClient(base_url=TARGET_BASE_URL, timeout=timeout_seconds)
     
     # Poll /v1/models to get the first available model
     try:
@@ -121,8 +152,9 @@ async def lifespan(app: FastAPI):
     
     yield # Application starts here
     print("FastAPI application shutdown.")
-    await client.aclose()
-    print("HTTPX client closed.")
+    if client:
+        await client.aclose()
+        print("HTTPX client closed.")
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
@@ -619,60 +651,71 @@ if __name__ == "__main__":
         description="Sampling Proxy"
     )
     parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default="config.json",
+        help="Path to configuration JSON file (default: config.json)",
+    )
+    parser.add_argument(
         "--host",
         type=str,
-        default=SAMPLING_PROXY_HOST,
-        help="Host address for the Sampling Proxy server (default: 0.0.0.0)",
+        help="Host address for the Sampling Proxy server (overrides config)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=SAMPLING_PROXY_PORT,
-        help="Port for the Sampling Proxy server (default: 8001)",
+        help="Port for the Sampling Proxy server (overrides config)",
     )
     parser.add_argument(
         "--target-host",
         type=str,
-        default=TARGET_HOST,
-        help="Host address for the OpenAI compatible backend (default: 127.0.0.1)",
+        help="Host address for the OpenAI compatible backend (overrides config)",
     )
     parser.add_argument(
         "--target-port",
         type=str, # Keep as string as it's used in f-string for URL
-        default=TARGET_PORT,
-        help="Port for the OpenAI compatible backend (default: 8000)",
+        help="Port for the OpenAI compatible backend (overrides config)",
     )
     parser.add_argument(
         "--debug-logs",
         "-d",
         action="store_true", # This makes it a boolean flag
-        help="Enable detailed debug logging.",
+        help="Enable detailed debug logging (overrides config)",
     )
     parser.add_argument(
         "--override-logs",
         "-o",
         action="store_true", # This makes it a boolean flag
-        help="Enable override logs to show when sampling parameters are being overridden.",
+        help="Enable override logs to show when sampling parameters are being overridden (overrides config)",
     )
     parser.add_argument(
         "--enforce-params",
         "-e",
         type=str,
-        help="Enforce specific sampling parameters as JSON string. Example: '{\"temperature\": 0.7, \"top_p\": 0.9}'",
+        help="Enforce specific sampling parameters as JSON string. Example: '{\"temperature\": 0.7, \"top_p\": 0.9}' (overrides config)",
     )
 
     args = parser.parse_args()
 
-    # Override global constants with command-line arguments
-    SAMPLING_PROXY_HOST = args.host
-    SAMPLING_PROXY_PORT = args.port
-    TARGET_HOST = args.target_host
-    TARGET_PORT = args.target_port
-    TARGET_BASE_URL = f"http://{TARGET_HOST}:{TARGET_PORT}" # Reconstruct with new values
-    ENABLE_DEBUG_LOGS = args.debug_logs # Set debug logs based on argument
-    ENABLE_OVERRIDE_LOGS = args.override_logs # Set override logs based on argument
+    # Load configuration with specified config file path
+    CONFIG = load_config(args.config)
     
-    # Parse enforced parameters from command line if provided
+    # Override global constants with command-line arguments (take precedence over config)
+    SAMPLING_PROXY_HOST = args.host if args.host is not None else CONFIG["server"]["sampling_proxy_host"]
+    SAMPLING_PROXY_PORT = args.port if args.port is not None else CONFIG["server"]["sampling_proxy_port"]
+    TARGET_HOST = args.target_host if args.target_host is not None else CONFIG["server"]["target_host"]
+    TARGET_PORT = args.target_port if args.target_port is not None else CONFIG["server"]["target_port"]
+    TARGET_BASE_URL = f"http://{TARGET_HOST}:{TARGET_PORT}" # Reconstruct with new values
+    ENABLE_DEBUG_LOGS = args.debug_logs if args.debug_logs is not None else CONFIG["logging"]["enable_debug_logs"]
+    ENABLE_OVERRIDE_LOGS = args.override_logs if args.override_logs is not None else CONFIG["logging"]["enable_override_logs"]
+    
+    # Load sampling parameters from config
+    DEFAULT_SAMPLING_PARAMS = CONFIG["default_sampling_params"]
+    ENFORCED_SAMPLING_PARAMS = CONFIG["enforced_sampling_params"]
+    MODEL_SAMPLING_PARAMS = CONFIG["model_sampling_params"]
+    
+    # Parse enforced parameters from command line if provided (takes precedence over config)
     if args.enforce_params:
         try:
             parsed_params = json.loads(args.enforce_params)

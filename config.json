@@ -1,0 +1,36 @@
+{
+  "server": {
+    "target_host": "127.0.0.1",
+    "target_port": "8000",
+    "sampling_proxy_host": "0.0.0.0",
+    "sampling_proxy_port": 8001,
+    "timeout_seconds": 1200.0
+  },
+  "logging": {
+    "enable_debug_logs": false,
+    "enable_override_logs": false
+  },
+  "default_sampling_params": {
+    "top_p": null,
+    "min_p": null,
+    "top_k": null,
+    "repetition_penalty": null,
+    "temperature": null
+  },
+  "enforced_sampling_params": {
+    "top_p": null,
+    "min_p": null,
+    "top_k": null,
+    "repetition_penalty": null,
+    "temperature": null
+  },
+  "model_sampling_params": {
+    "sample_model_name": {
+        "top_p": null,
+        "min_p": null,
+        "top_k": null,
+        "repetition_penalty": null,
+        "temperature": null
+    }
+  }
+}
