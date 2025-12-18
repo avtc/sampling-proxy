@@ -682,6 +682,7 @@ if __name__ == "__main__":
         "-d",
         action="store_true", # This makes it a boolean flag
         help="Enable detailed debug logging (overrides config)",
+        default=None,  # Explicitly set default to None to detect when it's not provided
     )
     parser.add_argument(
         "--override-logs",
