@@ -30,6 +30,27 @@ DEFAULT_SAMPLING_PARAMS = {
     "repetition_penalty": 1.05,
     "temperature": 0.6,
 }
+# Enforced sampling parameters - these will ALWAYS override incoming parameters
+# Set to empty dict {} to disable enforcement (default behavior)
+# Any parameters specified here will override both incoming request parameters
+# and model-specific defaults for ALL requests
+#
+# Priority order (highest to lowest):
+# 1. ENFORCED_SAMPLING_PARAMS (always applied, overrides everything)
+# 2. Parameters present in incoming request (kept as-is if not enforced)
+# 3. MODEL_SAMPLING_PARAMS (applied if parameter missing from request and not enforced)
+# 4. DEFAULT_SAMPLING_PARAMS (applied if parameter missing from request and not in model-specific)
+#
+# Usage examples:
+# - To enforce temperature to 0.7 regardless of what client sends: {"temperature": 0.7}
+# - To enforce multiple parameters: {"temperature": 0.7, "top_p": 0.9, "top_k": 50}
+# - To disable enforcement completely: {}
+ENFORCED_SAMPLING_PARAMS = {
+    # Example: Uncomment and modify to enforce specific parameters
+    # "temperature": 0.7,
+    # "top_p": 0.9,
+    # "top_k": 50,
+}
 
 # Model-specific sampling parameters
 # You can customize this dictionary to set specific parameters for different models.
@@ -121,6 +142,7 @@ async def read_root():
         "sglang_backend": SGLANG_BASE_URL,
         "middleware_port": MIDDLEWARE_PORT,
         "default_sampling_params": DEFAULT_SAMPLING_PARAMS,
+        "enforced_sampling_params": ENFORCED_SAMPLING_PARAMS,
         "model_sampling_params_configured": list(MODEL_SAMPLING_PARAMS.keys()),
         "generation_endpoints_monitored": GENERATION_ENDPOINTS,
         "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
@@ -324,10 +346,24 @@ async def proxy_sglang_requests(path: str, request: Request):
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Model-specific params for '{model_name}': {model_specific_params}")
 
-            # Iterate through all parameters defined in DEFAULT_SAMPLING_PARAMS.
-            # Apply overrides if the parameter is not already present in the incoming request.
+            # First, apply enforced parameters - these ALWAYS override incoming parameters
+            if ENFORCED_SAMPLING_PARAMS:
+                if ENABLE_DEBUG_LOGS:
+                    print(f"DEBUG: Applying enforced parameters: {ENFORCED_SAMPLING_PARAMS}")
+                for param, enforced_value in ENFORCED_SAMPLING_PARAMS.items():
+                    original_value = current_params_container.get(param, "not_set")
+                    current_params_container[param] = enforced_value
+                    print(f"DEBUG: ENFORCED '{param}' from '{original_value}' to '{enforced_value}'")
+
+            # Then, apply default parameters for any missing parameters not enforced
             for param, default_value in DEFAULT_SAMPLING_PARAMS.items():
                 if param not in current_params_container:
+                    # Skip if this parameter is being enforced (already handled above)
+                    if ENFORCED_SAMPLING_PARAMS and param in ENFORCED_SAMPLING_PARAMS:
+                        if ENABLE_DEBUG_LOGS:
+                            print(f"DEBUG: Parameter '{param}' is enforced, skipping default application.")
+                        continue
+                    
                     # If the parameter is missing from the incoming request,
                     # try to get it from model-specific settings, otherwise use the global default.
                     value_to_apply = model_specific_params.get(param, default_value)
@@ -611,6 +647,12 @@ if __name__ == "__main__":
         action="store_true", # This makes it a boolean flag
         help="Enable detailed debug logging.",
     )
+    parser.add_argument(
+        "--enforce-params",
+        "-e",
+        type=str,
+        help="Enforce specific sampling parameters as JSON string. Example: '{\"temperature\": 0.7, \"top_p\": 0.9}'",
+    )
 
     args = parser.parse_args()
 
@@ -621,6 +663,18 @@ if __name__ == "__main__":
     SGLANG_PORT = args.sglang_port
     SGLANG_BASE_URL = f"http://{SGLANG_HOST}:{SGLANG_PORT}" # Reconstruct with new values
     ENABLE_DEBUG_LOGS = args.debug_logs # Set debug logs based on argument
+    
+    # Parse enforced parameters from command line if provided
+    if args.enforce_params:
+        try:
+            parsed_params = json.loads(args.enforce_params)
+            if isinstance(parsed_params, dict):
+                ENFORCED_SAMPLING_PARAMS = parsed_params
+                print(f"Enforced sampling parameters from command line: {ENFORCED_SAMPLING_PARAMS}")
+            else:
+                print(f"WARNING: --enforce-params must be a JSON object. Ignoring invalid input: {args.enforce_params}")
+        except json.JSONDecodeError as e:
+            print(f"WARNING: Invalid JSON in --enforce-params: {e}. Ignoring.")
 
     print(f"Starting SGLang middleware server on http://{MIDDLEWARE_HOST}:{MIDDLEWARE_PORT}")
     print(f"Proxying requests to SGLang backend at {SGLANG_BASE_URL}")
