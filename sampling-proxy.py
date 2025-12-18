@@ -109,6 +109,7 @@ GENERATION_ENDPOINTS = [
 # List of Anthropic-specific endpoints that should be handled locally
 ANTHROPIC_ENDPOINTS = [
     "api/event_logging/batch",  # Anthropic event logging endpoint
+    "v1/messages/count_tokens", # Anthropic token counting endpoint
 ]
 
 # Global variable to store the first available model name from /v1/models
@@ -232,6 +233,73 @@ async def proxy_target_requests(path: str, request: Request):
                     print(f"ERROR: Error processing event logging: {e}")
                 return Response(
                     content=json.dumps({"error": "Failed to process events"}),
+                    status_code=500,
+                    media_type="application/json"
+                )
+        
+        elif path == "v1/messages/count_tokens":
+            # Handle token counting endpoint
+            if ENABLE_DEBUG_LOGS:
+                print(f"DEBUG: Processing token counting request")
+            
+            try:
+                # Read and parse the request body
+                body = await request.body()
+                if ENABLE_DEBUG_LOGS:
+                    print(f"DEBUG: Token counting body received: {len(body)} bytes")
+                
+                request_data = json.loads(body.decode('utf-8'))
+                messages = request_data.get("messages", [])
+                model = request_data.get("model", "claude-3-sonnet-20241022")
+                
+                if ENABLE_DEBUG_LOGS:
+                    print(f"DEBUG: Token counting request - model: {model}, messages: {messages}")
+                
+                # Simple token estimation (rough approximation)
+                # In a real implementation, you might want to use a proper tokenizer
+                total_tokens = 0
+                for message in messages:
+                    content = message.get("content", "")
+                    if isinstance(content, list):
+                        # Handle complex content format
+                        for content_item in content:
+                            if isinstance(content_item, dict) and content_item.get("type") == "text":
+                                text = content_item.get("text", "")
+                                # Rough estimation: ~4 characters per token for English text
+                                total_tokens += len(text) // 4 + 1
+                            elif isinstance(content_item, str):
+                                total_tokens += len(content_item) // 4 + 1
+                    elif isinstance(content, str):
+                        total_tokens += len(content) // 4 + 1
+                    else:
+                        total_tokens += len(str(content)) // 4 + 1
+                
+                # Return response in Anthropic format
+                response_data = {
+                    "input_tokens": total_tokens
+                }
+                
+                if ENABLE_DEBUG_LOGS:
+                    print(f"DEBUG: Token counting result: {total_tokens} tokens")
+                
+                return Response(
+                    content=json.dumps(response_data),
+                    status_code=200,
+                    media_type="application/json"
+                )
+            except json.JSONDecodeError as e:
+                if ENABLE_DEBUG_LOGS:
+                    print(f"ERROR: Invalid JSON in token counting request: {e}")
+                return Response(
+                    content=json.dumps({"error": {"type": "invalid_request_error", "message": "Invalid JSON"}}),
+                    status_code=400,
+                    media_type="application/json"
+                )
+            except Exception as e:
+                if ENABLE_DEBUG_LOGS:
+                    print(f"ERROR: Error processing token counting: {e}")
+                return Response(
+                    content=json.dumps({"error": {"type": "api_error", "message": "Failed to count tokens"}}),
                     status_code=500,
                     media_type="application/json"
                 )
@@ -467,8 +535,13 @@ async def proxy_target_requests(path: str, request: Request):
                 if ENABLE_DEBUG_LOGS:
                     print(f"DEBUG: OpenAI Compatible Response Headers (raw): {response_headers}")
 
-                response_headers.pop("content-length", None) # Remove Content-Length for streaming
-                response_headers.pop("transfer-encoding", None) # Remove Transfer-Encoding for streaming
+                # Remove headers that interfere with streaming
+                # Use case-insensitive removal to catch all variants
+                headers_to_remove = ["content-length", "transfer-encoding", "connection"]
+                for header in headers_to_remove:
+                    response_headers.pop(header, None)
+                    response_headers.pop(header.upper(), None)
+                    response_headers.pop(header.lower(), None)
 
                 # Explicitly set Content-Type for SSE if it's a streaming chat/completion request
                 # Use original_path for this check, as it's the actual path in the request
@@ -597,10 +670,16 @@ async def proxy_target_requests(path: str, request: Request):
                 
                 # Ensure the httpx response is closed after its content is read
                 await target_response.aclose()
+                
+                # Create clean headers for the response, removing Content-Length to prevent mismatches
+                clean_headers = dict(target_response.headers)
+                clean_headers.pop("content-length", None)
+                clean_headers.pop("Content-Length", None)
+                
                 return Response(
                     content=response_content,
                     status_code=target_response.status_code,
-                    headers=target_response.headers,
+                    headers=clean_headers,
                     media_type=target_response.headers.get("content-type"),
                 )
         else:
