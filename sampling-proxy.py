@@ -10,13 +10,15 @@ import argparse # Import argparse for command-line arguments
 
 # --- Configuration ---
 # SGLang backend server address and port
-SGLANG_HOST = os.getenv("SGLANG_HOST", "127.0.0.1")
-SGLANG_PORT = os.getenv("SGLANG_PORT", "8000")
+SGLANG_HOST = os.getenv("SGLANG_HOST", "192.168.1.14")
+SGLANG_PORT = os.getenv("SGLANG_PORT", "8001")
 SGLANG_BASE_URL = f"http://{SGLANG_HOST}:{SGLANG_PORT}"
 
 # Middleware server address and port
-MIDDLEWARE_HOST = os.getenv("MIDDLEWARE_HOST", "0.0.0.0")
+MIDDLEWARE_HOST = os.getenv("MIDDLEWARE_HOST", "127.0.0.1")
 MIDDLEWARE_PORT = int(os.getenv("MIDDLEWARE_PORT", "8001"))
+
+ENABLE_DEBUG_LOGS = False
 
 # Default sampling parameters to apply if not specified in the request
 # These values will be used if no model-specific override is found and
@@ -54,12 +56,21 @@ GENERATION_ENDPOINTS = [
     "generate",            # Common SGLang generation endpoint
     "v1/completions",      # OpenAI-compatible completions endpoint
     "v1/chat/completions", # OpenAI-compatible chat completions endpoint
+    "v1/messages",          # Anthropic-compatible messages endpoint
+]
+
+# List of Anthropic-specific endpoints that should be handled locally
+ANTHROPIC_ENDPOINTS = [
+    "api/event_logging/batch",  # Anthropic event logging endpoint
 ]
 
 # Initialize an httpx AsyncClient for making requests to the SGLang backend.
 # This client is designed for efficient connection pooling.
 # A higher timeout is set to accommodate potentially long LLM generation times.
 client = httpx.AsyncClient(base_url=SGLANG_BASE_URL, timeout=1200.0)
+
+# Global variable to store the first available model name from /v1/models
+FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
 
 # --- FastAPI Application Lifespan Setup ---
 @asynccontextmanager
@@ -68,7 +79,25 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events for the FastAPI application.
     Ensures the httpx client is properly closed when the application shuts down.
     """
+    global FIRST_AVAILABLE_MODEL
     print("FastAPI application startup.")
+    
+    # Poll /v1/models to get the first available model
+    try:
+        print(f"Polling {SGLANG_BASE_URL}/v1/models to get available models...")
+        response = await client.get("/v1/models")
+        if response.status_code == 200:
+            models_data = response.json()
+            if "data" in models_data and len(models_data["data"]) > 0:
+                FIRST_AVAILABLE_MODEL = models_data["data"][0]["id"]
+                print(f"Successfully retrieved first available model: {FIRST_AVAILABLE_MODEL}")
+            else:
+                print("WARNING: No models found in /v1/models response")
+        else:
+            print(f"WARNING: Failed to get models from /v1/models. Status: {response.status_code}")
+    except Exception as e:
+        print(f"WARNING: Error polling /v1/models: {e}")
+    
     yield # Application starts here
     print("FastAPI application shutdown.")
     await client.aclose()
@@ -94,6 +123,7 @@ async def read_root():
         "default_sampling_params": DEFAULT_SAMPLING_PARAMS,
         "model_sampling_params_configured": list(MODEL_SAMPLING_PARAMS.keys()),
         "generation_endpoints_monitored": GENERATION_ENDPOINTS,
+        "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
         "debug_logs_enabled": ENABLE_DEBUG_LOGS,
     }
 
@@ -116,11 +146,48 @@ async def proxy_sglang_requests(path: str, request: Request):
     if ENABLE_DEBUG_LOGS:
         print(f"DEBUG: Normalized path for matching: '{path}' (Original: '{original_path}')")
 
-    # Construct the target URL for the SGLang backend
-    # Ensure the query string is encoded to bytes as required by httpx.URL
-    target_url = httpx.URL(path=original_path, query=request.url.query.encode("utf-8")) # Use original_path for target URL
-    if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Target SGLang URL: {target_url}")
+    # Handle Anthropic-specific endpoints locally
+    if path in ANTHROPIC_ENDPOINTS:
+        if ENABLE_DEBUG_LOGS:
+            print(f"DEBUG: Handling Anthropic endpoint '{path}' locally")
+        
+        if path == "api/event_logging/batch":
+            # Handle event logging endpoint - return success response
+            if ENABLE_DEBUG_LOGS:
+                print(f"DEBUG: Processing event logging request")
+            
+            try:
+                # Read the request body to acknowledge receipt
+                body = await request.body()
+                if ENABLE_DEBUG_LOGS:
+                    print(f"DEBUG: Event logging body received: {len(body)} bytes")
+                
+                # Return a success response that mimics what Anthropic expects
+                response_data = {
+                    "status": "success",
+                    "message": "Events logged successfully"
+                }
+                
+                return Response(
+                    content=json.dumps(response_data),
+                    status_code=200,
+                    media_type="application/json"
+                )
+            except Exception as e:
+                if ENABLE_DEBUG_LOGS:
+                    print(f"ERROR: Error processing event logging: {e}")
+                return Response(
+                    content=json.dumps({"error": "Failed to process events"}),
+                    status_code=500,
+                    media_type="application/json"
+                )
+        
+        # For any other Anthropic endpoints, return a generic success
+        return Response(
+            content=json.dumps({"status": "ok"}),
+            status_code=200,
+            media_type="application/json"
+        )
 
     # Prepare headers for the outgoing request to SGLang.
     # We copy the incoming headers and remove 'host' and 'content-length'
@@ -131,15 +198,32 @@ async def proxy_sglang_requests(path: str, request: Request):
     if ENABLE_DEBUG_LOGS:
         print(f"DEBUG: Outgoing Request Headers (initial): {headers}")
 
-
     request_content = None # This will hold the request body to be sent to sglang
     is_generation_request = False
+    is_anthropic_request = False # Initialize Anthropic request flag
     incoming_json_body = {} # Initialize in case it's not a POST/JSON request
 
     # Determine if the current request path is a recognized generation endpoint
     is_generation_request = path in GENERATION_ENDPOINTS
+    is_anthropic_request = path == "v1/messages" # Check if this is an Anthropic request
     if ENABLE_DEBUG_LOGS:
         print(f"DEBUG: is_generation_request after check: {is_generation_request}")
+        print(f"DEBUG: is_anthropic_request: {is_anthropic_request}")
+
+    # Construct the target URL for the SGLang backend
+    # Redirect Anthropic requests to OpenAI chat completions endpoint
+    if is_anthropic_request:
+        # Convert /v1/messages to /v1/chat/completions for SGLang backend
+        target_path = "v1/chat/completions"
+        if ENABLE_DEBUG_LOGS:
+            print(f"DEBUG: Redirecting Anthropic request from {original_path} to {target_path}")
+    else:
+        target_path = original_path
+    
+    # Ensure the query string is encoded to bytes as required by httpx.URL
+    target_url = httpx.URL(path=target_path, query=request.url.query.encode("utf-8"))
+    if ENABLE_DEBUG_LOGS:
+        print(f"DEBUG: Target SGLang URL: {target_url}")
 
     # --- Sampling Parameter Override Logic ---
     if is_generation_request and request.method == "POST":
@@ -155,6 +239,69 @@ async def proxy_sglang_requests(path: str, request: Request):
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Parsed incoming JSON body: {incoming_json_body}")
 
+            # Handle Anthropic to OpenAI format conversion
+            if is_anthropic_request:
+                if ENABLE_DEBUG_LOGS:
+                    print("DEBUG: Converting Anthropic request to OpenAI format.")
+                
+                # Extract Anthropic format data
+                anthropic_messages = incoming_json_body.get("messages", [])
+                anthropic_model = incoming_json_body.get("model")
+                anthropic_max_tokens = incoming_json_body.get("max_tokens")
+                anthropic_temperature = incoming_json_body.get("temperature")
+                anthropic_top_p = incoming_json_body.get("top_p")
+                anthropic_stream = incoming_json_body.get("stream", False)
+                
+                # Convert Anthropic messages to OpenAI format
+                openai_messages = []
+                for msg in anthropic_messages:
+                    openai_msg = {
+                        "role": msg.get("role"),
+                        "content": ""
+                    }
+                    
+                    # Handle complex Anthropic content format
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        # Extract text from complex content objects
+                        text_parts = []
+                        for content_item in content:
+                            if isinstance(content_item, dict) and content_item.get("type") == "text":
+                                text_parts.append(content_item.get("text", ""))
+                            elif isinstance(content_item, str):
+                                text_parts.append(content_item)
+                        openai_msg["content"] = "".join(text_parts)
+                    elif isinstance(content, str):
+                        openai_msg["content"] = content
+                    else:
+                        openai_msg["content"] = str(content)
+                    
+                    openai_messages.append(openai_msg)
+                
+                # Override model with first available model for Anthropic requests
+                overridden_model = FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else anthropic_model
+                if ENABLE_DEBUG_LOGS and FIRST_AVAILABLE_MODEL:
+                    print(f"DEBUG: Overriding Anthropic model '{anthropic_model}' with first available model '{FIRST_AVAILABLE_MODEL}'")
+                
+                # Convert to OpenAI chat completions format
+                openai_request = {
+                    "model": overridden_model,
+                    "messages": openai_messages,
+                    "max_tokens": anthropic_max_tokens,
+                    "stream": anthropic_stream
+                }
+                
+                # Add optional parameters if present
+                if anthropic_temperature is not None:
+                    openai_request["temperature"] = anthropic_temperature
+                if anthropic_top_p is not None:
+                    openai_request["top_p"] = anthropic_top_p
+                
+                # Replace the incoming body with converted OpenAI format
+                incoming_json_body = openai_request
+                if ENABLE_DEBUG_LOGS:
+                    print(f"DEBUG: Converted to OpenAI format: {incoming_json_body}")
+
             model_name = incoming_json_body.get("model") # Get the model name from the request
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Model name from request: {model_name}")
@@ -167,7 +314,7 @@ async def proxy_sglang_requests(path: str, request: Request):
                 is_nested_params = True
                 if ENABLE_DEBUG_LOGS:
                     print(f"DEBUG: Path is 'generate', using nested 'sampling_params'. Current container: {current_params_container}")
-            else: # v1/completions, v1/chat/completions (normalized paths)
+            else: # v1/completions, v1/chat/completions, v1/messages (normalized paths)
                 current_params_container = incoming_json_body
                 is_nested_params = False
                 if ENABLE_DEBUG_LOGS:
@@ -217,33 +364,46 @@ async def proxy_sglang_requests(path: str, request: Request):
     # --- Forward Request and Handle Response ---
     try:
         if is_generation_request and request.method == "POST":
+            # Check if this is actually a streaming request
+            is_streaming_request = incoming_json_body.get("stream", False)
+            
             if ENABLE_DEBUG_LOGS:
-                print("DEBUG: Sending streaming request to SGLang.")
-            # For generation requests (POST to GENERATION_ENDPOINTS), use streaming
-            # Build the request object
-            sglang_request_obj = client.build_request(
-                method=request.method,
-                url=target_url, # Use original_path for the actual request
-                headers=headers,
-                params=request.query_params,
-                content=request_content,
-            )
-            # Send the request and get the raw response object, enabling streaming
-            sglang_response = await client.send(sglang_request_obj, stream=True)
+                print(f"DEBUG: Sending {'streaming' if is_streaming_request else 'non-streaming'} request to SGLang.")
+            
+            if is_streaming_request:
+                # For streaming requests, use streaming
+                sglang_request_obj = client.build_request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    params=request.query_params,
+                    content=request_content,
+                )
+                # Send the request and get the raw response object, enabling streaming
+                sglang_response = await client.send(sglang_request_obj, stream=True)
+            else:
+                # For non-streaming requests, fetch the full response
+                sglang_response = await client.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    params=request.query_params,
+                    content=request_content,
+                )
 
-            # Prepare response headers for streaming
-            response_headers = dict(sglang_response.headers)
-            if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: SGLang Response Headers (raw): {response_headers}")
+            if is_streaming_request:
+                # Handle streaming response
+                # Prepare response headers for streaming
+                response_headers = dict(sglang_response.headers)
+                if ENABLE_DEBUG_LOGS:
+                    print(f"DEBUG: SGLang Response Headers (raw): {response_headers}")
 
-            response_headers.pop("content-length", None) # Remove Content-Length for streaming
-            response_headers.pop("transfer-encoding", None) # Remove Transfer-Encoding for streaming
+                response_headers.pop("content-length", None) # Remove Content-Length for streaming
+                response_headers.pop("transfer-encoding", None) # Remove Transfer-Encoding for streaming
 
-            # Explicitly set Content-Type for SSE if it's a streaming chat/completion request
-            # Check if the original request intended streaming (from incoming_json_body)
-            if incoming_json_body.get("stream") is True:
+                # Explicitly set Content-Type for SSE if it's a streaming chat/completion request
                 # Use original_path for this check, as it's the actual path in the request
-                if original_path.strip('/') in ["v1/chat/completions", "v1/completions"]:
+                if original_path.strip('/') in ["v1/chat/completions", "v1/completions", "v1/messages"]:
                     response_headers["content-type"] = "text/event-stream"
                     response_headers["cache-control"] = "no-cache"
                     response_headers["connection"] = "keep-alive"
@@ -252,39 +412,131 @@ async def proxy_sglang_requests(path: str, request: Request):
                 else:
                     if ENABLE_DEBUG_LOGS:
                         print(f"DEBUG: Not an OpenAI-compatible streaming path, keeping original Content-Type: {response_headers.get('content-type', 'N/A')}")
+
+                # Define a local async generator to yield chunks and close the httpx response
+                async def stream_and_close_response():
+                    chunk_count = 0
+                    try:
+                        async for chunk in sglang_response.aiter_bytes():
+                            chunk_count += 1
+                            
+                            # Convert OpenAI streaming response to Anthropic format if needed
+                            if is_anthropic_request and chunk:
+                                try:
+                                    chunk_str = chunk.decode('utf-8')
+                                    if chunk_str.startswith('data: ') and not chunk_str.startswith('data: [DONE]'):
+                                        try:
+                                            openai_data = json.loads(chunk_str[6:])  # Remove 'data: ' prefix
+                                            
+                                            # Convert OpenAI format to Anthropic format
+                                            anthropic_data = {
+                                                "type": "content_block_delta",
+                                                "index": 0,
+                                                "delta": {
+                                                    "type": "text_delta",
+                                                    "text": openai_data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                                }
+                                            }
+                                            
+                                            # Add usage info if available
+                                            if "usage" in openai_data:
+                                                anthropic_data["usage"] = {
+                                                    "input_tokens": openai_data["usage"].get("prompt_tokens", 0),
+                                                    "output_tokens": openai_data["usage"].get("completion_tokens", 0)
+                                                }
+                                            
+                                            converted_chunk = f"data: {json.dumps(anthropic_data)}\n\n"
+                                            chunk = converted_chunk.encode('utf-8')
+                                            
+                                            if ENABLE_DEBUG_LOGS:
+                                                print(f"DEBUG: Converted streaming chunk to Anthropic format")
+                                        except json.JSONDecodeError:
+                                            # If we can't parse the JSON, just pass through the original chunk
+                                            pass
+                                except UnicodeDecodeError:
+                                    # If we can't decode as UTF-8, pass through the original chunk
+                                    pass
+                            
+                            # if ENABLE_DEBUG_LOGS: # Commented out for less verbose output during streaming
+                            #     print(f"DEBUG: Yielding chunk {chunk_count}, size: {len(chunk)} bytes.")
+                            yield chunk
+                            # await asyncio.sleep(0) # Yield control to event loop, may help with some race conditions
+                    except Exception as e:
+                        print(f"ERROR: Exception during streaming chunks: {e}")
+                        raise # Re-raise to propagate the error
+                    finally:
+                        # Ensure the httpx response is closed after iteration
+                        if ENABLE_DEBUG_LOGS:
+                            print(f"DEBUG: SGLang response connection closed by generator after {chunk_count} chunks.")
+                        await sglang_response.aclose()
+
+                return StreamingResponse(
+                    stream_and_close_response(), # Use the local async generator
+                    status_code=sglang_response.status_code,
+                    headers=response_headers,
+                    media_type=response_headers.get("content-type"),
+                )
             else:
+                # Handle non-streaming response
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Original request did not ask for streaming. Keeping original Content-Type: {response_headers.get('content-type', 'N/A')}")
-
-
-            # Define a local async generator to yield chunks and close the httpx response
-            async def stream_and_close_response():
-                chunk_count = 0
-                try:
-                    async for chunk in sglang_response.aiter_bytes():
-                        chunk_count += 1
-                        # if ENABLE_DEBUG_LOGS: # Commented out for less verbose output during streaming
-                        #     print(f"DEBUG: Yielding chunk {chunk_count}, size: {len(chunk)} bytes.")
-                        yield chunk
-                        # await asyncio.sleep(0) # Yield control to event loop, may help with some race conditions
-                except Exception as e:
-                    print(f"ERROR: Exception during streaming chunks: {e}")
-                    raise # Re-raise to propagate the error
-                finally:
-                    # Ensure the httpx response is closed after iteration
-                    if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: SGLang response connection closed by generator after {chunk_count} chunks.")
-                    await sglang_response.aclose()
-
-            return StreamingResponse(
-                stream_and_close_response(), # Use the local async generator
-                status_code=sglang_response.status_code,
-                headers=response_headers,
-                media_type=response_headers.get("content-type"),
-            )
+                    print(f"DEBUG: SGLang Response Headers (full): {sglang_response.headers}")
+                    print(f"DEBUG: SGLang Response Status: {sglang_response.status_code}")
+                    print(f"DEBUG: SGLang Response Content: {sglang_response.text}")
+                
+                # Handle Anthropic response conversion for non-streaming requests
+                response_content = sglang_response.content
+                
+                # Log 404 errors specifically for debugging
+                if sglang_response.status_code == 404:
+                    if is_anthropic_request:
+                        print(f"WARNING: Anthropic request to {target_path} returned 404. SGLang backend may not support OpenAI chat completions endpoint.")
+                    else:
+                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on SGLang backend.")
+                
+                if is_anthropic_request and sglang_response.status_code == 200:
+                    try:
+                        openai_response = json.loads(response_content.decode('utf-8'))
+                        
+                        # Convert OpenAI response to Anthropic format
+                        anthropic_response = {
+                            "id": openai_response.get("id", f"msg_{openai_response.get('created', 0)}"),
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": openai_response.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                }
+                            ],
+                            "model": openai_response.get("model", ""),
+                            "stop_reason": openai_response.get("choices", [{}])[0].get("finish_reason", "end_turn"),
+                            "stop_sequence": None,
+                            "usage": {
+                                "input_tokens": openai_response.get("usage", {}).get("prompt_tokens", 0),
+                                "output_tokens": openai_response.get("usage", {}).get("completion_tokens", 0)
+                            }
+                        }
+                        
+                        response_content = json.dumps(anthropic_response).encode('utf-8')
+                        if ENABLE_DEBUG_LOGS:
+                            print(f"DEBUG: Converted non-streaming response to Anthropic format")
+                            
+                    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, IndexError) as e:
+                        if ENABLE_DEBUG_LOGS:
+                            print(f"DEBUG: Could not convert response to Anthropic format: {e}. Using original response.")
+                        # Keep original response if conversion fails
+                
+                # Ensure the httpx response is closed after its content is read
+                await sglang_response.aclose()
+                return Response(
+                    content=response_content,
+                    status_code=sglang_response.status_code,
+                    headers=sglang_response.headers,
+                    media_type=sglang_response.headers.get("content-type"),
+                )
         else:
             if ENABLE_DEBUG_LOGS:
-                print("DEBUG: Sending non-streaming request to SGLang.")
+                print("DEBUG: Sending non-generation request to SGLang.")
             # For all other requests (e.g., GET /v1/models), fetch the full response
             sglang_response = await client.request(
                 method=request.method,
@@ -295,6 +547,12 @@ async def proxy_sglang_requests(path: str, request: Request):
             )
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: SGLang Response Headers (full): {sglang_response.headers}")
+                print(f"DEBUG: SGLang Response Status: {sglang_response.status_code}")
+            
+            # Log 404 errors specifically for debugging
+            if sglang_response.status_code == 404:
+                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on SGLang backend.")
+            
             # Ensure the httpx response is closed after its content is read
             await sglang_response.aclose()
             return Response(
