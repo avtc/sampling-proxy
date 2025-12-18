@@ -9,16 +9,17 @@ import asyncio # Import asyncio for potential sleep
 import argparse # Import argparse for command-line arguments
 
 # --- Configuration ---
-# SGLang backend server address and port
-SGLANG_HOST = os.getenv("SGLANG_HOST", "192.168.1.14")
-SGLANG_PORT = os.getenv("SGLANG_PORT", "8001")
-SGLANG_BASE_URL = f"http://{SGLANG_HOST}:{SGLANG_PORT}"
+# OpenAI Compatible backend server address and port
+TARGET_HOST = os.getenv("TARGET_HOST", "192.168.1.14")
+TARGET_PORT = os.getenv("TARGET_PORT", "8001")
+TARGET_BASE_URL = f"http://{TARGET_HOST}:{TARGET_PORT}"
 
 # Middleware server address and port
-MIDDLEWARE_HOST = os.getenv("MIDDLEWARE_HOST", "127.0.0.1")
-MIDDLEWARE_PORT = int(os.getenv("MIDDLEWARE_PORT", "8001"))
+SAMPLING_PROXY_HOST = os.getenv("SAMPLING_PROXY_HOST", "127.0.0.1")
+SAMPLING_PROXY_PORT = int(os.getenv("SAMPLING_PROXY_PORT", "8001"))
 
 ENABLE_DEBUG_LOGS = False
+ENABLE_OVERRIDE_LOGS = False
 
 # Default sampling parameters to apply if not specified in the request
 # These values will be used if no model-specific override is found and
@@ -85,10 +86,10 @@ ANTHROPIC_ENDPOINTS = [
     "api/event_logging/batch",  # Anthropic event logging endpoint
 ]
 
-# Initialize an httpx AsyncClient for making requests to the SGLang backend.
+# Initialize an httpx AsyncClient for making requests to the OpenAI Compatible backend.
 # This client is designed for efficient connection pooling.
 # A higher timeout is set to accommodate potentially long LLM generation times.
-client = httpx.AsyncClient(base_url=SGLANG_BASE_URL, timeout=1200.0)
+client = httpx.AsyncClient(base_url=TARGET_BASE_URL, timeout=1200.0)
 
 # Global variable to store the first available model name from /v1/models
 FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
@@ -105,7 +106,7 @@ async def lifespan(app: FastAPI):
     
     # Poll /v1/models to get the first available model
     try:
-        print(f"Polling {SGLANG_BASE_URL}/v1/models to get available models...")
+        print(f"Polling {TARGET_BASE_URL}/v1/models to get available models...")
         response = await client.get("/v1/models")
         if response.status_code == 200:
             models_data = response.json()
@@ -126,8 +127,8 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
-    title="SGLang Sampling Parameter Override Middleware",
-    description="A middleware server to override SGLang sampling parameters for generation requests.",
+    title="Sampling Proxy",
+    description="A middleware server to override sampling parameters for generation requests, supports OpenAI Compatible target server and OpenAI Compatible and Anthropic requests.",
     version="1.0.0",
     lifespan=lifespan # Register the lifespan context manager
 )
@@ -138,9 +139,9 @@ async def read_root():
     Root endpoint for a basic health check and to display middleware configuration.
     """
     return {
-        "message": "SGLang Sampling Parameter Override Middleware is running.",
-        "sglang_backend": SGLANG_BASE_URL,
-        "middleware_port": MIDDLEWARE_PORT,
+        "message": "Sampling Proxy is running.",
+        "target_backend": TARGET_BASE_URL,
+        "sampling_proxy_port": SAMPLING_PROXY_PORT,
         "default_sampling_params": DEFAULT_SAMPLING_PARAMS,
         "enforced_sampling_params": ENFORCED_SAMPLING_PARAMS,
         "model_sampling_params_configured": list(MODEL_SAMPLING_PARAMS.keys()),
@@ -150,12 +151,12 @@ async def read_root():
     }
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def proxy_sglang_requests(path: str, request: Request):
+async def proxy_target_requests(path: str, request: Request):
     """
-    Catch-all route to proxy all incoming requests to the SGLang backend.
+    Catch-all route to proxy all incoming requests to the OpenAI Compatible backend.
     For POST requests to configured generation endpoints, it applies
     the sampling parameter override logic.
-    Supports streaming responses from the SGLang backend back to the client.
+    Supports streaming responses from the OpenAI Compatible backend back to the client.
     """
     # Access ENABLE_DEBUG_LOGS from the global scope
     global ENABLE_DEBUG_LOGS
@@ -211,7 +212,7 @@ async def proxy_sglang_requests(path: str, request: Request):
             media_type="application/json"
         )
 
-    # Prepare headers for the outgoing request to SGLang.
+    # Prepare headers for the outgoing request to OpenAI Compatible backend.
     # We copy the incoming headers and remove 'host' and 'content-length'
     # as httpx will manage these for the new request.
     headers = dict(request.headers)
@@ -220,7 +221,7 @@ async def proxy_sglang_requests(path: str, request: Request):
     if ENABLE_DEBUG_LOGS:
         print(f"DEBUG: Outgoing Request Headers (initial): {headers}")
 
-    request_content = None # This will hold the request body to be sent to sglang
+    request_content = None # This will hold the request body to be sent to target
     is_generation_request = False
     is_anthropic_request = False # Initialize Anthropic request flag
     incoming_json_body = {} # Initialize in case it's not a POST/JSON request
@@ -232,10 +233,10 @@ async def proxy_sglang_requests(path: str, request: Request):
         print(f"DEBUG: is_generation_request after check: {is_generation_request}")
         print(f"DEBUG: is_anthropic_request: {is_anthropic_request}")
 
-    # Construct the target URL for the SGLang backend
+    # Construct the target URL for the OpenAI Compatible backend
     # Redirect Anthropic requests to OpenAI chat completions endpoint
     if is_anthropic_request:
-        # Convert /v1/messages to /v1/chat/completions for SGLang backend
+        # Convert /v1/messages to /v1/chat/completions for OpenAI Compatible backend
         target_path = "v1/chat/completions"
         if ENABLE_DEBUG_LOGS:
             print(f"DEBUG: Redirecting Anthropic request from {original_path} to {target_path}")
@@ -245,7 +246,7 @@ async def proxy_sglang_requests(path: str, request: Request):
     # Ensure the query string is encoded to bytes as required by httpx.URL
     target_url = httpx.URL(path=target_path, query=request.url.query.encode("utf-8"))
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Target SGLang URL: {target_url}")
+        print(f"DEBUG: Target OpenAI Compatible URL: {target_url}")
 
     # --- Sampling Parameter Override Logic ---
     if is_generation_request and request.method == "POST":
@@ -353,7 +354,8 @@ async def proxy_sglang_requests(path: str, request: Request):
                 for param, enforced_value in ENFORCED_SAMPLING_PARAMS.items():
                     original_value = current_params_container.get(param, "not_set")
                     current_params_container[param] = enforced_value
-                    print(f"DEBUG: ENFORCED '{param}' from '{original_value}' to '{enforced_value}'")
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"DEBUG: ENFORCED '{param}' from '{original_value}' to '{enforced_value}'")
 
             # Then, apply default parameters for any missing parameters not enforced
             for param, default_value in DEFAULT_SAMPLING_PARAMS.items():
@@ -368,11 +370,11 @@ async def proxy_sglang_requests(path: str, request: Request):
                     # try to get it from model-specific settings, otherwise use the global default.
                     value_to_apply = model_specific_params.get(param, default_value)
                     current_params_container[param] = value_to_apply
-                    #if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Overriding '{param}' to '{value_to_apply}' (was not in request).")
+                    if ENABLE_OVERRIDE_LOGS:
+                        print(f"DEBUG: Overriding '{param}' to '{value_to_apply}' (was not in request).")
                 else:
-                    #if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
+                    if ENABLE_OVERRIDE_LOGS:
+                        print(f"DEBUG: Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
 
             # Re-integrate the modified parameters back into the main body if they were nested
             if is_nested_params:
@@ -383,7 +385,7 @@ async def proxy_sglang_requests(path: str, request: Request):
             headers["content-type"] = "application/json" # Ensure content-type header is correct
 
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Final modified request body (to SGLang): {request_content}")
+                print(f"DEBUG: Final modified request body: {request_content}")
                 print(f"[{request.method} {original_path}] Overridden sampling params for model '{model_name}': {current_params_container}")
 
         except json.JSONDecodeError as e:
@@ -404,11 +406,11 @@ async def proxy_sglang_requests(path: str, request: Request):
             is_streaming_request = incoming_json_body.get("stream", False)
             
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Sending {'streaming' if is_streaming_request else 'non-streaming'} request to SGLang.")
+                print(f"DEBUG: Sending {'streaming' if is_streaming_request else 'non-streaming'} request.")
             
             if is_streaming_request:
                 # For streaming requests, use streaming
-                sglang_request_obj = client.build_request(
+                target_request_obj = client.build_request(
                     method=request.method,
                     url=target_url,
                     headers=headers,
@@ -416,10 +418,10 @@ async def proxy_sglang_requests(path: str, request: Request):
                     content=request_content,
                 )
                 # Send the request and get the raw response object, enabling streaming
-                sglang_response = await client.send(sglang_request_obj, stream=True)
+                target_response = await client.send(target_request_obj, stream=True)
             else:
                 # For non-streaming requests, fetch the full response
-                sglang_response = await client.request(
+                target_response = await client.request(
                     method=request.method,
                     url=target_url,
                     headers=headers,
@@ -430,9 +432,9 @@ async def proxy_sglang_requests(path: str, request: Request):
             if is_streaming_request:
                 # Handle streaming response
                 # Prepare response headers for streaming
-                response_headers = dict(sglang_response.headers)
+                response_headers = dict(target_response.headers)
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: SGLang Response Headers (raw): {response_headers}")
+                    print(f"DEBUG: OpenAI Compatible Response Headers (raw): {response_headers}")
 
                 response_headers.pop("content-length", None) # Remove Content-Length for streaming
                 response_headers.pop("transfer-encoding", None) # Remove Transfer-Encoding for streaming
@@ -453,7 +455,7 @@ async def proxy_sglang_requests(path: str, request: Request):
                 async def stream_and_close_response():
                     chunk_count = 0
                     try:
-                        async for chunk in sglang_response.aiter_bytes():
+                        async for chunk in target_response.aiter_bytes():
                             chunk_count += 1
                             
                             # Convert OpenAI streaming response to Anthropic format if needed
@@ -503,33 +505,33 @@ async def proxy_sglang_requests(path: str, request: Request):
                     finally:
                         # Ensure the httpx response is closed after iteration
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: SGLang response connection closed by generator after {chunk_count} chunks.")
-                        await sglang_response.aclose()
+                            print(f"DEBUG: OpenAI Compatible response connection closed by generator after {chunk_count} chunks.")
+                        await target_response.aclose()
 
                 return StreamingResponse(
                     stream_and_close_response(), # Use the local async generator
-                    status_code=sglang_response.status_code,
+                    status_code=target_response.status_code,
                     headers=response_headers,
                     media_type=response_headers.get("content-type"),
                 )
             else:
                 # Handle non-streaming response
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: SGLang Response Headers (full): {sglang_response.headers}")
-                    print(f"DEBUG: SGLang Response Status: {sglang_response.status_code}")
-                    print(f"DEBUG: SGLang Response Content: {sglang_response.text}")
+                    print(f"DEBUG: OpenAI Compatible Response Headers (full): {target_response.headers}")
+                    print(f"DEBUG: OpenAI Compatible Response Status: {target_response.status_code}")
+                    print(f"DEBUG: OpenAI Compatible Response Content: {target_response.text}")
                 
                 # Handle Anthropic response conversion for non-streaming requests
-                response_content = sglang_response.content
+                response_content = target_response.content
                 
                 # Log 404 errors specifically for debugging
-                if sglang_response.status_code == 404:
+                if target_response.status_code == 404:
                     if is_anthropic_request:
-                        print(f"WARNING: Anthropic request to {target_path} returned 404. SGLang backend may not support OpenAI chat completions endpoint.")
+                        print(f"WARNING: Anthropic request to {target_path} returned 404. OpenAI Compatible backend may not support OpenAI chat completions endpoint.")
                     else:
-                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on SGLang backend.")
+                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on OpenAI Compatible backend.")
                 
-                if is_anthropic_request and sglang_response.status_code == 200:
+                if is_anthropic_request and target_response.status_code == 200:
                     try:
                         openai_response = json.loads(response_content.decode('utf-8'))
                         
@@ -563,18 +565,18 @@ async def proxy_sglang_requests(path: str, request: Request):
                         # Keep original response if conversion fails
                 
                 # Ensure the httpx response is closed after its content is read
-                await sglang_response.aclose()
+                await target_response.aclose()
                 return Response(
                     content=response_content,
-                    status_code=sglang_response.status_code,
-                    headers=sglang_response.headers,
-                    media_type=sglang_response.headers.get("content-type"),
+                    status_code=target_response.status_code,
+                    headers=target_response.headers,
+                    media_type=target_response.headers.get("content-type"),
                 )
         else:
             if ENABLE_DEBUG_LOGS:
-                print("DEBUG: Sending non-generation request to SGLang.")
+                print("DEBUG: Sending non-generation request to OpenAI Compatible.")
             # For all other requests (e.g., GET /v1/models), fetch the full response
-            sglang_response = await client.request(
+            target_response = await client.request(
                 method=request.method,
                 url=target_url, # Use original_path for the actual request
                 headers=headers,
@@ -582,29 +584,29 @@ async def proxy_sglang_requests(path: str, request: Request):
                 content=request_content,
             )
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: SGLang Response Headers (full): {sglang_response.headers}")
-                print(f"DEBUG: SGLang Response Status: {sglang_response.status_code}")
+                print(f"DEBUG: OpenAI Compatible Response Headers (full): {target_response.headers}")
+                print(f"DEBUG: OpenAI Compatible Response Status: {target_response.status_code}")
             
             # Log 404 errors specifically for debugging
-            if sglang_response.status_code == 404:
-                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on SGLang backend.")
+            if target_response.status_code == 404:
+                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on OpenAI Compatible backend.")
             
             # Ensure the httpx response is closed after its content is read
-            await sglang_response.aclose()
+            await target_response.aclose()
             return Response(
-                content=sglang_response.content,
-                status_code=sglang_response.status_code,
-                headers=sglang_response.headers,
-                media_type=sglang_response.headers.get("content-type"),
+                content=target_response.content,
+                status_code=target_response.status_code,
+                headers=target_response.headers,
+                media_type=target_response.headers.get("content-type"),
             )
 
     except httpx.ConnectError as e:
-        print(f"ERROR: [{request.method} {original_path}] Connection error to SGLANG backend: {e}")
-        return Response(f"Could not connect to SGLang backend at {SGLANG_BASE_URL}: {e}",
+        print(f"ERROR: [{request.method} {original_path}] Connection error to OpenAI Compatible backend: {e}")
+        return Response(f"Could not connect to OpenAI Compatible backend at {TARGET_BASE_URL}: {e}",
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     except httpx.RequestError as e:
-        print(f"ERROR: [{request.method} {original_path}] Request error to SGLANG backend: {e}")
-        return Response(f"An error occurred while requesting SGLang backend: {e}",
+        print(f"ERROR: [{request.method} {original_path}] Request error to OpenAI Compatible backend: {e}")
+        return Response(f"An error occurred while requesting OpenAI Compatible backend: {e}",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
         print(f"ERROR: [{request.method} {original_path}] An unexpected error occurred: {e}")
@@ -615,37 +617,43 @@ async def proxy_sglang_requests(path: str, request: Request):
 if __name__ == "__main__":
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="SGLang Sampling Parameter Override Middleware Server."
+        description="Sampling Proxy"
     )
     parser.add_argument(
         "--host",
         type=str,
-        default=MIDDLEWARE_HOST,
-        help="Host address for the middleware server (default: 0.0.0.0)",
+        default=SAMPLING_PROXY_HOST,
+        help="Host address for the Sampling Proxy server (default: 0.0.0.0)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=MIDDLEWARE_PORT,
-        help="Port for the middleware server (default: 8001)",
+        default=SAMPLING_PROXY_PORT,
+        help="Port for the Sampling Proxy server (default: 8001)",
     )
     parser.add_argument(
-        "--sglang-host",
+        "--target-host",
         type=str,
-        default=SGLANG_HOST,
-        help="Host address for the SGLang backend (default: 127.0.0.1)",
+        default=TARGET_HOST,
+        help="Host address for the OpenAI compatible backend (default: 127.0.0.1)",
     )
     parser.add_argument(
-        "--sglang-port",
+        "--target-port",
         type=str, # Keep as string as it's used in f-string for URL
-        default=SGLANG_PORT,
-        help="Port for the SGLang backend (default: 8000)",
+        default=TARGET_PORT,
+        help="Port for the OpenAI compatible backend (default: 8000)",
     )
     parser.add_argument(
         "--debug-logs",
         "-d",
         action="store_true", # This makes it a boolean flag
         help="Enable detailed debug logging.",
+    )
+    parser.add_argument(
+        "--override-logs",
+        "-o",
+        action="store_true", # This makes it a boolean flag
+        help="Enable override logs to show when sampling parameters are being overridden.",
     )
     parser.add_argument(
         "--enforce-params",
@@ -657,12 +665,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Override global constants with command-line arguments
-    MIDDLEWARE_HOST = args.host
-    MIDDLEWARE_PORT = args.port
-    SGLANG_HOST = args.sglang_host
-    SGLANG_PORT = args.sglang_port
-    SGLANG_BASE_URL = f"http://{SGLANG_HOST}:{SGLANG_PORT}" # Reconstruct with new values
+    SAMPLING_PROXY_HOST = args.host
+    SAMPLING_PROXY_PORT = args.port
+    TARGET_HOST = args.target_host
+    TARGET_PORT = args.target_port
+    TARGET_BASE_URL = f"http://{TARGET_HOST}:{TARGET_PORT}" # Reconstruct with new values
     ENABLE_DEBUG_LOGS = args.debug_logs # Set debug logs based on argument
+    ENABLE_OVERRIDE_LOGS = args.override_logs # Set override logs based on argument
     
     # Parse enforced parameters from command line if provided
     if args.enforce_params:
@@ -676,7 +685,8 @@ if __name__ == "__main__":
         except json.JSONDecodeError as e:
             print(f"WARNING: Invalid JSON in --enforce-params: {e}. Ignoring.")
 
-    print(f"Starting SGLang middleware server on http://{MIDDLEWARE_HOST}:{MIDDLEWARE_PORT}")
-    print(f"Proxying requests to SGLang backend at {SGLANG_BASE_URL}")
+    print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
+    print(f"Proxying requests to OpenAI Compatible backend at {TARGET_BASE_URL}")
     print(f"Debug logs are {'ENABLED' if ENABLE_DEBUG_LOGS else 'DISABLED'}.")
-    uvicorn.run(app, host=MIDDLEWARE_HOST, port=MIDDLEWARE_PORT)
+    print(f"Override logs are {'ENABLED' if ENABLE_OVERRIDE_LOGS else 'DISABLED'}.")
+    uvicorn.run(app, host=SAMPLING_PROXY_HOST, port=SAMPLING_PROXY_PORT)
