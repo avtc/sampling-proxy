@@ -43,7 +43,12 @@ A middleware server that intercepts and modifies sampling parameters for generat
    source sampling-proxy/bin/activate
    ```
 
-4. **Install the dependencies**:
+4. **Make the shell script executable**:
+   ```bash
+   chmod +x ./sampling-proxy.sh
+   ```
+
+5. **Install the dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
