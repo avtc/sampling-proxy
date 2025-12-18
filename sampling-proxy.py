@@ -688,6 +688,7 @@ if __name__ == "__main__":
         "-o",
         action="store_true", # This makes it a boolean flag
         help="Enable override logs to show when sampling parameters are being overridden (overrides config)",
+        default=None,  # Explicitly set default to None to detect when it's not provided
     )
     parser.add_argument(
         "--enforce-params",
