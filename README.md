@@ -22,7 +22,7 @@ A middleware server that intercepts and modifies sampling parameters for generat
 
 1. **Clone or download the project**:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/avtc/sampling-proxy.git
    cd sampling-proxy
    ```
 
