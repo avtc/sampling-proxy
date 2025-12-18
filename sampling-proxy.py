@@ -10,12 +10,12 @@ import argparse # Import argparse for command-line arguments
 
 # --- Configuration ---
 # OpenAI Compatible backend server address and port
-TARGET_HOST = os.getenv("TARGET_HOST", "192.168.1.14")
-TARGET_PORT = os.getenv("TARGET_PORT", "8001")
+TARGET_HOST = os.getenv("TARGET_HOST", "127.0.0.1")
+TARGET_PORT = os.getenv("TARGET_PORT", "8000")
 TARGET_BASE_URL = f"http://{TARGET_HOST}:{TARGET_PORT}"
 
 # Middleware server address and port
-SAMPLING_PROXY_HOST = os.getenv("SAMPLING_PROXY_HOST", "127.0.0.1")
+SAMPLING_PROXY_HOST = os.getenv("SAMPLING_PROXY_HOST", "0.0.0.0")
 SAMPLING_PROXY_PORT = int(os.getenv("SAMPLING_PROXY_PORT", "8001"))
 
 ENABLE_DEBUG_LOGS = False
