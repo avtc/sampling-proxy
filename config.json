@@ -1,7 +1,7 @@
 {
   "server": {
     "target_base_url": "http://127.0.0.1:8000/v1",
-    "sampling_proxy_base_path": "/v1",
+    "sampling_proxy_base_path": "",
     "sampling_proxy_host": "0.0.0.0",
     "sampling_proxy_port": 8001,
     "timeout_seconds": 1200.0

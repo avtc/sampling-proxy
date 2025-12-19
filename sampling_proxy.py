@@ -137,8 +137,8 @@ MODEL_SAMPLING_PARAMS = {}
 # Note: Paths here should NOT have leading/trailing slashes for direct comparison
 GENERATION_ENDPOINTS = [
     "generate",            # Common SGLang generation endpoint
-    "v1/completions",      # OpenAI-compatible completions endpoint
-    "v1/chat/completions", # OpenAI-compatible chat completions endpoint
+    "completions",      # OpenAI-compatible completions endpoint
+    "chat/completions", # OpenAI-compatible chat completions endpoint
     "v1/messages",          # Anthropic-compatible messages endpoint
 ]
 
@@ -371,10 +371,10 @@ async def proxy_target_requests(path: str, request: Request):
     # Construct the target URL for the OpenAI Compatible backend
     # Redirect Anthropic requests to OpenAI chat completions endpoint
     if is_anthropic_request:
-        # Convert /v1/messages to /v1/chat/completions for OpenAI Compatible backend
+        # Convert /v1/messages to /chat/completions for OpenAI Compatible backend
         # First apply the path transformation, then change to chat completions
         transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
-        target_path = transformed_path.replace("/messages", "/chat/completions", 1)
+        target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
         if ENABLE_DEBUG_LOGS:
             print(f"DEBUG: Redirecting Anthropic request from {original_path} to {target_path}")
     else:
@@ -647,7 +647,7 @@ async def proxy_target_requests(path: str, request: Request):
                 is_nested_params = True
                 if ENABLE_DEBUG_LOGS:
                     print(f"DEBUG: Path is 'generate', using nested 'sampling_params'. Current container: {current_params_container}")
-            else: # v1/completions, v1/chat/completions, v1/messages (normalized paths)
+            else: # completions, chat/completions, v1/messages (normalized paths)
                 current_params_container = incoming_json_body
                 is_nested_params = False
                 if ENABLE_DEBUG_LOGS:
@@ -756,7 +756,7 @@ async def proxy_target_requests(path: str, request: Request):
 
                 # Explicitly set Content-Type for SSE if it's a streaming chat/completion request
                 # Use original_path for this check, as it's the actual path in the request
-                if original_path.strip('/') in ["v1/chat/completions", "v1/completions", "v1/messages"]:
+                if original_path.strip('/') in ["chat/completions", "completions", "v1/messages"]:
                     response_headers["content-type"] = "text/event-stream"
                     response_headers["cache-control"] = "no-cache"
                     response_headers["connection"] = "keep-alive"
@@ -1003,7 +1003,7 @@ async def proxy_target_requests(path: str, request: Request):
         else:
             if ENABLE_DEBUG_LOGS:
                 print("DEBUG: Sending non-generation request to OpenAI Compatible.")
-            # For all other requests (e.g., GET /v1/models), fetch the full response
+            # For all other requests (e.g., GET /models), fetch the full response
             target_response = await client.request(
                 method=request.method,
                 url=target_url, # Use original_path for the actual request
