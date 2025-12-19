@@ -32,3 +32,6 @@ _ReSharper*/
 #Nuget packages folder
 packages/
 __pycache__
+
+# Configuration file (create from config_sample.json)
+config.json

@@ -48,10 +48,49 @@ A middleware server that intercepts and modifies sampling parameters for generat
    chmod +x ./sampling_proxy.sh
    ```
 
-5. **Install the dependencies**:
+5. **Create configuration file**:
+   ```bash
+   cp config_sample.json config.json
+   ```
+   Then edit `config.json` to match your specific configuration needs.
+
+6. **Install the dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
+
+## Updating from Git
+
+To update your existing installation to the latest version from the git repository:
+
+1. **Navigate to the project directory**:
+   ```bash
+   cd sampling-proxy
+   ```
+
+2. **Activate the virtual environment**:
+
+   **On Windows:**
+   ```cmd
+   sampling-proxy\Scripts\activate
+   ```
+
+   **On macOS/Linux:**
+   ```bash
+   source sampling-proxy/bin/activate
+   ```
+
+3. **Pull the latest changes**:
+   ```bash
+   git pull origin main
+   ```
+
+4. **Update dependencies** (if requirements.txt has changed):
+   ```bash
+   pip install -r requirements.txt --upgrade
+   ```
+
+5. **Restart the proxy server** if it's currently running.
 
 ## Usage
 
@@ -105,7 +144,7 @@ Available options:
 
 ## Configuration
 
-The proxy uses an external `config.json` file for configuration. You can specify a custom config file path with the `--config` command-line argument.
+The proxy uses an external `config.json` file for configuration. A sample configuration file `config_sample.json` is provided - copy it to `config.json` and modify as needed. You can specify a custom config file path with the `--config` command-line argument.
 
 ### Sampling Parameter Priority
 
