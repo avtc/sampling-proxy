@@ -45,7 +45,7 @@ A middleware server that intercepts and modifies sampling parameters for generat
 
 4. **Make the shell script executable**:
    ```bash
-   chmod +x ./sampling-proxy.sh
+   chmod +x ./sampling_proxy.sh
    ```
 
 5. **Install the dependencies**:
@@ -60,7 +60,7 @@ A middleware server that intercepts and modifies sampling parameters for generat
 Run the proxy server with default settings:
 
 ```bash
-python sampling-proxy.py
+python sampling_proxy.py
 ```
 
 This will start the proxy server on `http://0.0.0.0:8001` and forward requests to an OpenAI-compatible backend at `http://127.0.0.1:8000`.
@@ -68,80 +68,44 @@ This will start the proxy server on `http://0.0.0.0:8001` and forward requests t
 ### Command Line Options
 
 ```bash
-python sampling-proxy.py --help
+python sampling_proxy.py --help
 ```
 
 Available options:
 - `--config, -c`: Path to configuration JSON file (default: config.json)
 - `--host`: Host address for the proxy server (overrides config)
 - `--port`: Port for the proxy server (overrides config)
-- `--target-host`: Host address for the backend (overrides config)
-- `--target-port`: Port for the backend (overrides config)
+- `--base-path`: Base path for the proxy server i.e. `/v1` (overrides config)
+- `--target-base-url`: OpenAI compatible backend base url (overrides config)
 - `--debug-logs, -d`: Enable detailed debug logging (overrides config)
 - `--override-logs, -o`: Show when sampling parameters are overridden (overrides config)
 - `--enforce-params, -e`: Enforce specific parameters as JSON string (overrides config)
 
 ### Examples
 
-1. **Run with custom ports and debug logging**:
+1. **Run with custom target base url and debug logging**:
    ```bash
-   python sampling-proxy.py --port 8080 --target-port 8081 --debug-logs
+   python sampling_proxy.py --target-base-url http://127.0.0.1:8000/v1 --debug-logs
    ```
 
 2. **Run with a custom configuration file**:
    ```bash
-   python sampling-proxy.py --config my-config.json
+   python sampling_proxy.py --config my-config.json
    ```
 
 3. **Run with enforced parameters**:
    ```bash
-   python sampling-proxy.py --enforce-params '{"temperature": 0.7, "top_p": 0.9}'
+   python sampling_proxy.py --enforce-params '{"temperature": 0.7, "top_p": 0.9}'
    ```
 
 4. **Run with override logs to see parameter changes**:
    ```bash
-   python sampling-proxy.py --override-logs
+   python sampling_proxy.py --override-logs
    ```
-
-### Environment Variables
-
-You can also configure the proxy using environment variables:
-
-- `TARGET_HOST`: Backend host address (default: 127.0.0.1)
-- `TARGET_PORT`: Backend port (default: 8000)
-- `SAMPLING_PROXY_HOST`: Proxy host address (default: 0.0.0.0)
-- `SAMPLING_PROXY_PORT`: Proxy port (default: 8001)
-
-Example:
-```bash
-export TARGET_HOST=192.168.1.100
-export TARGET_PORT=8080
-export SAMPLING_PROXY_PORT=9090
-python sampling-proxy.py
-```
 
 ## Configuration
 
 The proxy uses an external `config.json` file for configuration. You can specify a custom config file path with the `--config` command-line argument.
-
-### Configuration Fields
-
-- **server**: Network and timeout settings
-  - `target_host`: Backend server host (default: "127.0.0.1")
-  - `target_port`: Backend server port (default: "8000")
-  - `sampling_proxy_host`: Proxy server host (default: "0.0.0.0")
-  - `sampling_proxy_port`: Proxy server port (default: 8001)
-  - `timeout_seconds`: HTTP request timeout in seconds (default: 1200.0)
-
-- **logging**: Debug and logging options
-  - `enable_debug_logs`: Enable detailed debug logging (default: false)
-  - `enable_override_logs`: Show parameter override logs (default: false)
-
-- **default_sampling_params**: Fallback parameters applied when not specified in request
-- **enforced_sampling_params**: Parameters that always override incoming values
-- **model_sampling_params**: Model-specific parameter configurations
-
-**Note**: Set parameter values to `null` to disable them (they will be filtered out).
 
 ### Sampling Parameter Priority
 
@@ -158,12 +122,12 @@ The proxy handles the following endpoints:
 
 ### Generation Endpoints (with parameter override)
 - `/generate` - SGLang generation endpoint
-- `/v1/completions` - OpenAI completions
-- `/v1/chat/completions` - OpenAI chat completions
-- `/v1/messages` - Anthropic messages (converted to OpenAI format)
+- `/completions` - OpenAI completions
+- `/chat/completions` - OpenAI chat completions
+- `/messages` - Anthropic messages (converted to OpenAI format)
 
 ### Other Endpoints (proxied without modification)
-- `/v1/models` - List available models
+- `/models` - List available models
 - All other endpoints are passed through to the backend
 
 ### Health Check
@@ -191,7 +155,7 @@ response = client.chat.completions.create(
 from anthropic import Anthropic
 
 client = Anthropic(
-    base_url="http://localhost:8001",  # Point to the proxy
+    base_url="http://localhost:8001/v1",  # Point to the proxy
     api_key="not-required"
 )
 
@@ -206,7 +170,7 @@ response = client.messages.create(
 
 ### Enable Debug Logging
 ```bash
-python sampling-proxy.py --debug-logs --override-logs
+python sampling_proxy.py --debug-logs --override-logs
 ```
 
 ### Common Issues
@@ -232,12 +196,12 @@ For convenience, use the provided scripts to start the proxy with the correct vi
 
 ### Linux/macOS
 ```bash
-./sampling-proxy.sh
+./sampling_proxy.sh
 ```
 
 ### Windows
 ```powershell
-.\sampling-proxy.ps1
+.\sampling_proxy.ps1
 ```
 
-Both scripts will automatically activate the `sampling-proxy` virtual environment and start the proxy server.
+Both scripts will automatically activate the `sampling_proxy` virtual environment and start the proxy server.

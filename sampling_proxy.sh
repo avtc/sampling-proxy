@@ -31,4 +31,4 @@ fi
 
 # Start the proxy server
 echo "Starting Sampling Proxy..."
-python sampling-proxy.py "$@"
+python sampling_proxy.py "$@"

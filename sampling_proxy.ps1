@@ -43,9 +43,9 @@ if ($env:VIRTUAL_ENV) {
     # Pass all command line arguments to the Python script
     $ArgsList = $args
     if ($ArgsList.Count -gt 0) {
-        & python sampling-proxy.py $ArgsList
+        & python sampling_proxy.py $ArgsList
     } else {
-        & python sampling-proxy.py
+        & python sampling_proxy.py
     }
 } else {
     Write-Host "Failed to activate virtual environment" -ForegroundColor Red
