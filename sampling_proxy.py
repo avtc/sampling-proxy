@@ -664,7 +664,7 @@ async def proxy_target_requests(path: str, request: Request):
                 for param, enforced_value in ENFORCED_SAMPLING_PARAMS.items():
                     original_value = current_params_container.get(param, "not_set")
                     current_params_container[param] = enforced_value
-                    if ENABLE_DEBUG_LOGS:
+                    if ENABLE_OVERRIDE_LOGS:
                         print(f"DEBUG: ENFORCED '{param}' from '{original_value}' to '{enforced_value}'")
 
             # Then, apply default parameters for any missing parameters not enforced
