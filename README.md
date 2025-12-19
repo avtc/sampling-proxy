@@ -63,7 +63,7 @@ Run the proxy server with default settings:
 python sampling_proxy.py
 ```
 
-This will start the proxy server on `http://0.0.0.0:8001` and forward requests to an OpenAI-compatible backend at `http://127.0.0.1:8000`.
+This will start the proxy server on `http://0.0.0.0:8001` and forward requests to an OpenAI-compatible backend at `http://127.0.0.1:8000/v1`.
 
 ### Command Line Options
 
@@ -75,7 +75,7 @@ Available options:
 - `--config, -c`: Path to configuration JSON file (default: config.json)
 - `--host`: Host address for the proxy server (overrides config)
 - `--port`: Port for the proxy server (overrides config)
-- `--base-path`: Base path for the proxy server i.e. `/v1` (overrides config)
+- `--base-path`: Base path for the proxy server (overrides config)
 - `--target-base-url`: OpenAI compatible backend base url (overrides config)
 - `--debug-logs, -d`: Enable detailed debug logging (overrides config)
 - `--override-logs, -o`: Show when sampling parameters are overridden (overrides config)
@@ -140,7 +140,7 @@ The proxy handles the following endpoints:
 import openai
 
 client = openai.OpenAI(
-    base_url="http://localhost:8001/v1",  # Point to the proxy
+    base_url="http://localhost:8001",  # Point to the proxy
     api_key="not-required"
 )
 
@@ -155,7 +155,7 @@ response = client.chat.completions.create(
 from anthropic import Anthropic
 
 client = Anthropic(
-    base_url="http://localhost:8001/v1",  # Point to the proxy
+    base_url="http://localhost:8001",  # Point to the proxy
     api_key="not-required"
 )
 
