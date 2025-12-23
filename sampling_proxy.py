@@ -17,7 +17,7 @@ def load_config(config_path="config.json"):
     default_config = {
         "server": {
             "target_base_url": "http://127.0.0.1:8000/v1",
-            "sampling_proxy_base_path": "/v1",
+            "sampling_proxy_base_path": "",
             "sampling_proxy_host": "0.0.0.0",
             "sampling_proxy_port": 8001,
             "timeout_seconds": 1200.0
@@ -27,7 +27,11 @@ def load_config(config_path="config.json"):
             "enable_override_logs": False
         },
         "default_sampling_params": {},
-        "enforced_sampling_params": {},
+        "override": {
+            "only_anthropic": False,
+            "model_name": None,
+            "sampling_params": {}
+        },
         "model_sampling_params": {}
     }
     
@@ -57,11 +61,14 @@ def load_config(config_path="config.json"):
                 if v is not None
             }
         
-        if merged_config.get("enforced_sampling_params"):
-            merged_config["enforced_sampling_params"] = {
-                k: v for k, v in merged_config["enforced_sampling_params"].items()
-                if v is not None
-            }
+        # Filter out null values from override.sampling_params
+        if merged_config.get("override"):
+            override_config = merged_config["override"]
+            if "sampling_params" in override_config:
+                override_config["sampling_params"] = {
+                    k: v for k, v in override_config["sampling_params"].items()
+                    if v is not None
+                }
         
         if merged_config.get("model_sampling_params"):
             filtered_model_params = {}
@@ -130,7 +137,10 @@ SAMPLING_PROXY_BASE_PATH = None
 ENABLE_DEBUG_LOGS = False
 ENABLE_OVERRIDE_LOGS = False
 DEFAULT_SAMPLING_PARAMS = {}
-ENFORCED_SAMPLING_PARAMS = {}
+OVERRIDE_CONFIG = {}
+OVERRIDE_ONLY_ANTHROPIC = False
+OVERRIDE_MODEL_NAME = None
+OVERRIDE_SAMPLING_PARAMS = {}
 MODEL_SAMPLING_PARAMS = {}
 
 # List of API paths that are considered "generation" endpoints.
@@ -148,7 +158,7 @@ ANTHROPIC_ENDPOINTS = [
     "v1/messages/count_tokens", # Anthropic token counting endpoint
 ]
 
-# Global variable to store the first available model name from /models
+# Global variable to store the first available model name from /models to be used for anthropic requests
 FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
 
 # Initialize an httpx AsyncClient for making requests to the OpenAI Compatible backend.
@@ -211,7 +221,7 @@ async def read_root():
         "target_backend": TARGET_BASE_URL,
         "sampling_proxy_port": SAMPLING_PROXY_PORT,
         "default_sampling_params": DEFAULT_SAMPLING_PARAMS,
-        "enforced_sampling_params": ENFORCED_SAMPLING_PARAMS,
+        "override": OVERRIDE_CONFIG,
         "model_sampling_params_configured": list(MODEL_SAMPLING_PARAMS.keys()),
         "generation_endpoints_monitored": GENERATION_ENDPOINTS,
         "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
@@ -552,10 +562,15 @@ async def proxy_target_requests(path: str, request: Request):
                             # Continue with next message instead of failing completely
                             continue
                     
-                    # Override model with first available model for Anthropic requests
-                    overridden_model = FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else anthropic_model
-                    if ENABLE_DEBUG_LOGS and FIRST_AVAILABLE_MODEL:
-                        print(f"DEBUG: Overriding Anthropic model '{anthropic_model}' with first available model '{FIRST_AVAILABLE_MODEL}'")
+                    # Override model for Anthropic requests
+                    if OVERRIDE_MODEL_NAME:
+                        overridden_model = OVERRIDE_MODEL_NAME
+                        if ENABLE_OVERRIDE_LOGS:
+                            print(f"OVERRIDE: Anthropic model '{anthropic_model}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
+                    else:
+                        overridden_model = FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else anthropic_model
+                        if ENABLE_DEBUG_LOGS and FIRST_AVAILABLE_MODEL:
+                            print(f"DEBUG: Using first available model '{FIRST_AVAILABLE_MODEL}' for Anthropic request")
                     
                     # Convert to OpenAI chat completions format
                     openai_request = {
@@ -625,8 +640,9 @@ async def proxy_target_requests(path: str, request: Request):
                         print(f"ERROR: Original Anthropic request: {incoming_json_body}")
                     
                     # Create a minimal valid OpenAI request as fallback
+                    fallback_model = OVERRIDE_MODEL_NAME if OVERRIDE_MODEL_NAME else (FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else "gpt-3.5-turbo")
                     incoming_json_body = {
-                        "model": FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else "gpt-3.5-turbo",
+                        "model": fallback_model,
                         "messages": [{"role": "user", "content": "Conversion failed. Please respond."}],
                         "max_tokens": anthropic_max_tokens if 'anthropic_max_tokens' in locals() else 1000,
                         "stream": anthropic_stream if 'anthropic_stream' in locals() else False
@@ -635,9 +651,20 @@ async def proxy_target_requests(path: str, request: Request):
                     if ENABLE_DEBUG_LOGS:
                         print(f"DEBUG: Using fallback OpenAI request: {incoming_json_body}")
 
-            model_name = incoming_json_body.get("model") # Get the model name from the request
+            # Get the model name from the request
+            model_name = incoming_json_body.get("model")
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Model name from request: {model_name}")
+            
+            # Apply model name override for non-Anthropic requests when applicable
+            if not is_anthropic_request:
+                # If only_anthropic is false, apply model name override to all non-Anthropic requests
+                if not OVERRIDE_ONLY_ANTHROPIC and OVERRIDE_MODEL_NAME:
+                    original_model_name = model_name
+                    model_name = OVERRIDE_MODEL_NAME
+                    incoming_json_body["model"] = model_name
+                    if ENABLE_OVERRIDE_LOGS:
+                        print(f"OVERRIDE: Non-Anthropic model '{original_model_name}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
 
             # Determine where sampling parameters are expected in the request body
             # For /generate, they are typically in a 'sampling_params' sub-dictionary
@@ -657,23 +684,29 @@ async def proxy_target_requests(path: str, request: Request):
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Model-specific params for '{model_name}': {model_specific_params}")
 
-            # First, apply enforced parameters - these ALWAYS override incoming parameters
-            if ENFORCED_SAMPLING_PARAMS:
-                if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Applying enforced parameters: {ENFORCED_SAMPLING_PARAMS}")
-                for param, enforced_value in ENFORCED_SAMPLING_PARAMS.items():
-                    original_value = current_params_container.get(param, "not_set")
-                    current_params_container[param] = enforced_value
+            # First, apply override parameters - these override incoming parameters based on only_anthropic flag
+            if OVERRIDE_SAMPLING_PARAMS:
+                # Check if we should apply overrides (only_anthropic=false OR this is an Anthropic request)
+                should_apply_overrides = not OVERRIDE_ONLY_ANTHROPIC or is_anthropic_request
+                
+                if should_apply_overrides:
                     if ENABLE_OVERRIDE_LOGS:
-                        print(f"DEBUG: ENFORCED '{param}' from '{original_value}' to '{enforced_value}'")
+                        print(f"OVERRIDE: Applying sampling parameter overrides: {OVERRIDE_SAMPLING_PARAMS}")
+                        if OVERRIDE_ONLY_ANTHROPIC:
+                            print(f"OVERRIDE: Overrides only applied to Anthropic requests (is_anthropic_request={is_anthropic_request})")
+                    for param, override_value in OVERRIDE_SAMPLING_PARAMS.items():
+                        original_value = current_params_container.get(param, "not_set")
+                        current_params_container[param] = override_value
+                        if ENABLE_OVERRIDE_LOGS:
+                            print(f"OVERRIDE: '{param}' from '{original_value}' to '{override_value}'")
 
-            # Then, apply default parameters for any missing parameters not enforced
+            # Then, apply default parameters for any missing parameters not overridden
             for param, default_value in DEFAULT_SAMPLING_PARAMS.items():
                 if param not in current_params_container:
-                    # Skip if this parameter is being enforced (already handled above)
-                    if ENFORCED_SAMPLING_PARAMS and param in ENFORCED_SAMPLING_PARAMS:
+                    # Skip if this parameter is being overridden (already handled above)
+                    if OVERRIDE_SAMPLING_PARAMS and param in OVERRIDE_SAMPLING_PARAMS:
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Parameter '{param}' is enforced, skipping default application.")
+                            print(f"DEBUG: Parameter '{param}' is overridden, skipping default application.")
                         continue
                     
                     # If the parameter is missing from the incoming request,
@@ -1089,10 +1122,20 @@ if __name__ == "__main__":
         default=None,  # Explicitly set default to None to detect when it's not provided
     )
     parser.add_argument(
-        "--enforce-params",
-        "-e",
+        "--override-sampling-params",
         type=str,
-        help="Enforce specific sampling parameters as JSON string. Example: '{\"temperature\": 0.7, \"top_p\": 0.9}' (overrides config)",
+        help="Override specific sampling parameters as JSON string. Example: '{\"temperature\": 0.7, \"top_p\": 0.9}' (overrides config)",
+    )
+    parser.add_argument(
+        "--override-only-anthropic",
+        action="store_true",
+        help="Apply overrides only to Anthropic requests (overrides config)",
+        default=None,
+    )
+    parser.add_argument(
+        "--override-model-name",
+        type=str,
+        help="Override model name in requests (overrides config)",
     )
 
     args = parser.parse_args()
@@ -1111,20 +1154,36 @@ if __name__ == "__main__":
     
     # Load sampling parameters from config
     DEFAULT_SAMPLING_PARAMS = CONFIG["default_sampling_params"]
-    ENFORCED_SAMPLING_PARAMS = CONFIG["enforced_sampling_params"]
+    OVERRIDE_CONFIG = CONFIG["override"]
+    OVERRIDE_ONLY_ANTHROPIC = OVERRIDE_CONFIG.get("only_anthropic", False)
+    OVERRIDE_MODEL_NAME = OVERRIDE_CONFIG.get("model_name")
+    OVERRIDE_SAMPLING_PARAMS = OVERRIDE_CONFIG.get("sampling_params", {})
     MODEL_SAMPLING_PARAMS = CONFIG["model_sampling_params"]
     
-    # Parse enforced parameters from command line if provided (takes precedence over config)
-    if args.enforce_params:
+    # Parse override parameters from command line if provided (takes precedence over config)
+    if args.override_sampling_params:
         try:
-            parsed_params = json.loads(args.enforce_params)
+            parsed_params = json.loads(args.override_sampling_params)
             if isinstance(parsed_params, dict):
-                ENFORCED_SAMPLING_PARAMS = parsed_params
-                print(f"Enforced sampling parameters from command line: {ENFORCED_SAMPLING_PARAMS}")
+                OVERRIDE_SAMPLING_PARAMS = parsed_params
+                OVERRIDE_CONFIG["sampling_params"] = OVERRIDE_SAMPLING_PARAMS
+                print(f"Override sampling parameters from command line: {OVERRIDE_SAMPLING_PARAMS}")
             else:
-                print(f"WARNING: --enforce-params must be a JSON object. Ignoring invalid input: {args.enforce_params}")
+                print(f"WARNING: --override-sampling-params must be a JSON object. Ignoring invalid input: {args.override_sampling_params}")
         except json.JSONDecodeError as e:
-            print(f"WARNING: Invalid JSON in --enforce-params: {e}. Ignoring.")
+            print(f"WARNING: Invalid JSON in --override-sampling-params: {e}. Ignoring.")
+    
+    # Handle override-only-anthropic flag from command line
+    if args.override_only_anthropic is not None:
+        OVERRIDE_ONLY_ANTHROPIC = args.override_only_anthropic
+        OVERRIDE_CONFIG["only_anthropic"] = OVERRIDE_ONLY_ANTHROPIC
+        print(f"Override only_anthropic from command line: {OVERRIDE_ONLY_ANTHROPIC}")
+    
+    # Handle override-model-name from command line
+    if args.override_model_name is not None:
+        OVERRIDE_MODEL_NAME = args.override_model_name
+        OVERRIDE_CONFIG["model_name"] = OVERRIDE_MODEL_NAME
+        print(f"Override model_name from command line: {OVERRIDE_MODEL_NAME}")
 
     print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
     print(f"Proxying requests to OpenAI Compatible backend at {TARGET_BASE_URL}")

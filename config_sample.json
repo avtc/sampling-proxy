@@ -17,12 +17,16 @@
     "repetition_penalty": null,
     "temperature": null
   },
-  "enforced_sampling_params": {
-    "top_p": null,
-    "min_p": null,
-    "top_k": null,
-    "repetition_penalty": null,
-    "temperature": null
+  "override": {
+    "only_anthropic": false,
+    "model_name": null,
+    "sampling_params": {
+      "top_p": null,
+      "min_p": null,
+      "top_k": null,
+      "repetition_penalty": null,
+      "temperature": null
+    }
   },
   "model_sampling_params": {
     "sample_model_name": {
