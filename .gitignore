@@ -36,3 +36,6 @@ __pycache__
 # Configuration file (create from config_sample.json)
 config.json
 .aider*
+
+# Worktree directories
+.worktrees/
