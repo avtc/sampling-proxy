@@ -1,12 +1,22 @@
 import os
 import json
 import httpx
+from typing import Optional
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 import uvicorn
 import asyncio # Import asyncio for potential sleep
 import argparse # Import argparse for command-line arguments
+
+# Import validator module for garbage detection
+from validator import (
+    validate_response,
+    save_failed_response,
+    create_error_message,
+    calculate_retry_delay,
+    ValidationResult
+)
 
 def load_config(config_path="config.json"):
     """
@@ -20,7 +30,10 @@ def load_config(config_path="config.json"):
             "sampling_proxy_base_path": "",
             "sampling_proxy_host": "0.0.0.0",
             "sampling_proxy_port": 8001,
-            "timeout_seconds": 1200.0
+            "connect_timeout_seconds": 5.0,
+            "timeout_seconds": 1200.0,
+            "supports_openai": True,
+            "supports_anthropic": False
         },
         "logging": {
             "enable_debug_logs": False,
@@ -32,7 +45,19 @@ def load_config(config_path="config.json"):
             "model_name": None,
             "sampling_params": {}
         },
-        "model_sampling_params": {}
+        "model_sampling_params": {},
+        "validation": {
+            "enabled": False,
+            "validator_url": "http://127.0.0.1:1234",
+            "validator_model": "qwen-3.5-0.8b",
+            "supports_openai": True,
+            "supports_anthropic": False,
+            "connect_timeout_seconds": 5.0,
+            "timeout_seconds": 300.0,
+            "max_retries": 3,
+            "retry_base_delay_seconds": 1.0,
+            "retry_multiplier": 2.0
+        }
     }
     
     if not os.path.exists(config_path):
@@ -136,6 +161,7 @@ SAMPLING_PROXY_PORT = None
 SAMPLING_PROXY_BASE_PATH = None
 ENABLE_DEBUG_LOGS = False
 ENABLE_OVERRIDE_LOGS = False
+ENABLE_VALIDATION_LOGS = False
 DEFAULT_SAMPLING_PARAMS = {}
 OVERRIDE_CONFIG = {}
 OVERRIDE_ONLY_ANTHROPIC = False
@@ -143,13 +169,19 @@ OVERRIDE_MODEL_NAME = None
 OVERRIDE_SAMPLING_PARAMS = {}
 MODEL_SAMPLING_PARAMS = {}
 
-# List of API paths that are considered "generation" endpoints.
-# Note: Paths here should NOT have leading/trailing slashes for direct comparison
-GENERATION_ENDPOINTS = [
+# Server capability configuration
+# Determines what formats the backend server supports for passthrough
+SERVER_SUPPORTS_OPENAI = True
+SERVER_SUPPORTS_ANTHROPIC = False
+VALIDATION_CONFIG = {"enabled": False}
+
+# List of API path suffixes that are considered "generation" endpoints.
+# Note: We check if the path ENDS WITH these suffixes to handle various prefixes
+GENERATION_ENDPOINT_SUFFIXES = [
     "generate",            # Common SGLang generation endpoint
-    "completions",      # OpenAI-compatible completions endpoint
-    "chat/completions", # OpenAI-compatible chat completions endpoint
-    "v1/messages",          # Anthropic-compatible messages endpoint
+    "completions",         # OpenAI-compatible completions endpoint
+    "chat/completions",    # OpenAI-compatible chat completions endpoint
+    "v1/messages",         # Anthropic-compatible messages endpoint
 ]
 
 # List of Anthropic-specific endpoints that should be handled locally
@@ -176,26 +208,50 @@ async def lifespan(app: FastAPI):
     """
     global FIRST_AVAILABLE_MODEL, client
     print("FastAPI application startup.")
-    
+
     # Initialize client with the correct TARGET_BASE_URL and timeout from config
-    timeout_seconds = CONFIG["server"].get("timeout_seconds", 1200.0)
-    client = httpx.AsyncClient(base_url=TARGET_BASE_URL, timeout=timeout_seconds)
+    connect_timeout = CONFIG["server"].get("connect_timeout_seconds", 5.0)
+    read_timeout = CONFIG["server"].get("timeout_seconds", 1200.0)
+    timeout = httpx.Timeout(connect=connect_timeout, read=read_timeout, write=read_timeout, pool=connect_timeout)
+    client = httpx.AsyncClient(base_url=TARGET_BASE_URL, timeout=timeout)
     
-    # Poll /models to get the first available model
-    try:
-        print(f"Polling {TARGET_BASE_URL}/models to get available models...")
-        response = await client.get("/models")
-        if response.status_code == 200:
-            models_data = response.json()
-            if "data" in models_data and len(models_data["data"]) > 0:
-                FIRST_AVAILABLE_MODEL = models_data["data"][0]["id"]
-                print(f"Successfully retrieved first available model: {FIRST_AVAILABLE_MODEL}")
-            else:
-                print("WARNING: No models found in /models response")
+    # Validate server capabilities - at least one format must be supported
+    if not SERVER_SUPPORTS_OPENAI and not SERVER_SUPPORTS_ANTHROPIC:
+        raise ValueError(
+            "Invalid configuration: server must support at least one format. "
+            "Set 'supports_openai: true' and/or 'supports_anthropic: true' in config."
+        )
+
+    # Poll /models to get the first available model (only if server supports OpenAI and no override model set)
+    # Skip polling if: 1) server doesn't support OpenAI (/models is OpenAI-only), or 2) override model already configured
+    if SERVER_SUPPORTS_OPENAI and not OVERRIDE_MODEL_NAME:
+        # If target base path is empty, use /v1/models for standard OpenAI/Anthropic servers
+        # Otherwise, the base path already includes the prefix
+        if not TARGET_BASE_PATH:
+            models_path = "/v1/models"
         else:
-            print(f"WARNING: Failed to get models from /models. Status: {response.status_code}")
-    except Exception as e:
-        print(f"WARNING: Error polling /models: {e}")
+            models_path = "/models"
+
+        try:
+            print(f"Polling {TARGET_BASE_URL}{models_path} to get available models...")
+            response = await client.get(models_path)
+            if response.status_code == 200:
+                models_data = response.json()
+                if "data" in models_data and len(models_data["data"]) > 0:
+                    FIRST_AVAILABLE_MODEL = models_data["data"][0]["id"]
+                    print(f"Successfully retrieved first available model: {FIRST_AVAILABLE_MODEL}")
+                else:
+                    print("WARNING: No models found in /models response")
+            else:
+                print(f"WARNING: Failed to get models from {models_path}. Status: {response.status_code}")
+        except Exception as e:
+            print(f"WARNING: Error polling {models_path}: {e}")
+    elif OVERRIDE_MODEL_NAME:
+        # Use the override model name as the first available model
+        FIRST_AVAILABLE_MODEL = OVERRIDE_MODEL_NAME
+        print(f"Using override model name: {FIRST_AVAILABLE_MODEL}")
+    else:
+        print("Skipping model polling (server doesn't support OpenAI format)")
     
     yield # Application starts here
     print("FastAPI application shutdown.")
@@ -223,10 +279,295 @@ async def read_root():
         "default_sampling_params": DEFAULT_SAMPLING_PARAMS,
         "override": OVERRIDE_CONFIG,
         "model_sampling_params_configured": list(MODEL_SAMPLING_PARAMS.keys()),
-        "generation_endpoints_monitored": GENERATION_ENDPOINTS,
+        "generation_endpoints_monitored": GENERATION_ENDPOINT_SUFFIXES,
         "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
         "debug_logs_enabled": ENABLE_DEBUG_LOGS,
     }
+
+def parse_sse_to_response(sse_text: str) -> Optional[dict]:
+    """Parse SSE stream text to extract final response dict."""
+    content_blocks = {}
+    current_index = None
+    message_data = None
+
+    for line in sse_text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith('data: '):
+            data_str = line[6:]
+            if data_str == '[DONE]':
+                continue
+
+            try:
+                data = json.loads(data_str)
+                event_type = data.get('type')
+
+                if event_type == 'message_start':
+                    message_data = data.get('message', {})
+                elif event_type == 'content_block_start':
+                    index = data.get('index', 0)
+                    content_blocks[index] = data.get('content_block', {}).copy()
+                    current_index = index
+                elif event_type == 'content_block_delta':
+                    index = data.get('index', 0)
+                    delta = data.get('delta', {})
+
+                    if index not in content_blocks:
+                        content_blocks[index] = {}
+
+                    if delta.get('type') == 'text_delta':
+                        existing_text = content_blocks[index].get('text', '')
+                        content_blocks[index]['text'] = existing_text + delta.get('text', '')
+                    elif delta.get('type') == 'input_json_delta':
+                        existing_json = content_blocks[index].get('_partial_json', '')
+                        content_blocks[index]['_partial_json'] = existing_json + delta.get('partial_json', '')
+                elif event_type == 'message_stop':
+                    # Build final response
+                    if message_data:
+                        content = []
+                        for idx in sorted(content_blocks.keys()):
+                            block = content_blocks[idx]
+                            block_type = block.get('type', 'text')
+                            if block_type == 'tool_use':
+                                partial_json = block.pop('_partial_json', '')
+                                if partial_json:
+                                    try:
+                                        block['input'] = json.loads(partial_json)
+                                    except json.JSONDecodeError:
+                                        block['input'] = {}
+                                content.append(block)
+                            else:
+                                content.append(block)
+
+                        message_data['content'] = content
+                        return message_data
+
+            except json.JSONDecodeError:
+                continue
+
+    return None
+
+
+def parse_openai_sse_to_response(sse_text: str) -> Optional[dict]:
+    """Parse OpenAI SSE stream text to reconstruct the full response dict."""
+    content_parts = []
+    tool_calls = {}  # index -> {id, name, arguments}
+    finish_reason = None
+    response_id = None
+    model = None
+    usage = None
+
+    for line in sse_text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith('data: '):
+            data_str = line[6:]
+            if data_str == '[DONE]':
+                continue
+
+            try:
+                data = json.loads(data_str)
+
+                # Extract metadata from first chunk
+                if response_id is None:
+                    response_id = data.get('id')
+                    model = data.get('model')
+
+                # Extract usage if present
+                if 'usage' in data:
+                    usage = data['usage']
+
+                choices = data.get('choices', [])
+                if choices:
+                    choice = choices[0]
+                    delta = choice.get('delta', {})
+                    finish_reason = choice.get('finish_reason') or finish_reason
+
+                    # Handle text content
+                    if 'content' in delta and delta['content']:
+                        content_parts.append(delta['content'])
+
+                    # Handle tool calls
+                    if 'tool_calls' in delta:
+                        for tc in delta['tool_calls']:
+                            idx = tc.get('index', 0)
+                            if idx not in tool_calls:
+                                tool_calls[idx] = {'id': '', 'name': '', 'arguments': ''}
+
+                            if 'id' in tc:
+                                tool_calls[idx]['id'] = tc['id']
+                            if 'function' in tc:
+                                if 'name' in tc['function']:
+                                    tool_calls[idx]['name'] = tc['function']['name']
+                                if 'arguments' in tc['function']:
+                                    tool_calls[idx]['arguments'] += tc['function']['arguments']
+
+            except json.JSONDecodeError:
+                continue
+
+    # Build final OpenAI response
+    if response_id is None:
+        return None
+
+    # Build message content
+    message = {'role': 'assistant'}
+    if content_parts:
+        message['content'] = ''.join(content_parts)
+    else:
+        message['content'] = ''
+
+    if tool_calls:
+        message['tool_calls'] = []
+        for idx in sorted(tool_calls.keys()):
+            tc = tool_calls[idx]
+            message['tool_calls'].append({
+                'id': tc['id'] or f'call_{idx}',
+                'type': 'function',
+                'function': {
+                    'name': tc['name'],
+                    'arguments': tc['arguments']
+                }
+            })
+
+    response = {
+        'id': response_id,
+        'object': 'chat.completion',
+        'created': 0,
+        'model': model or '',
+        'choices': [{
+            'index': 0,
+            'message': message,
+            'finish_reason': finish_reason or 'stop'
+        }]
+    }
+
+    if usage:
+        response['usage'] = usage
+
+    return response
+
+
+def convert_openai_sse_to_anthropic_chunks(sse_text: str) -> list:
+    """Convert OpenAI SSE chunks to Anthropic SSE chunks for streaming."""
+    anthropic_chunks = []
+    content_block_index = 0
+    has_tool_calls = False
+
+    # First, collect all chunks to determine structure
+    openai_chunks = []
+    for line in sse_text.split('\n'):
+        line = line.strip()
+        if line.startswith('data: ') and line[6:] != '[DONE]':
+            try:
+                openai_chunks.append(json.loads(line[6:]))
+            except json.JSONDecodeError:
+                pass
+
+    # Generate message_start
+    if openai_chunks:
+        first_chunk = openai_chunks[0]
+        anthropic_chunks.append({
+            'type': 'message_start',
+            'message': {
+                'id': first_chunk.get('id', 'msg_unknown'),
+                'type': 'message',
+                'role': 'assistant',
+                'content': [],
+                'model': first_chunk.get('model', ''),
+                'stop_reason': None,
+                'usage': {'input_tokens': 0, 'output_tokens': 0}
+            }
+        })
+
+    # Process each chunk
+    for data in openai_chunks:
+        choices = data.get('choices', [])
+        if not choices:
+            continue
+
+        choice = choices[0]
+        delta = choice.get('delta', {})
+
+        # Handle text content
+        if 'content' in delta and delta['content']:
+            if not has_tool_calls:
+                # Only emit text deltas if we haven't started tool calls
+                anthropic_chunks.append({
+                    'type': 'content_block_delta',
+                    'index': content_block_index,
+                    'delta': {
+                        'type': 'text_delta',
+                        'text': delta['content']
+                    }
+                })
+
+        # Handle tool calls
+        if 'tool_calls' in delta:
+            has_tool_calls = True
+            for tc in delta['tool_calls']:
+                idx = tc.get('index', 0)
+                if 'function' in tc:
+                    func = tc['function']
+                    if 'name' in func:
+                        # Start new tool call block
+                        content_block_index = idx
+                        anthropic_chunks.append({
+                            'type': 'content_block_start',
+                            'index': idx,
+                            'content_block': {
+                                'type': 'tool_use',
+                                'id': tc.get('id', f'toolu_{idx}'),
+                                'name': func['name'],
+                                'input': {}
+                            }
+                        })
+                    elif 'arguments' in func:
+                        # Arguments delta
+                        anthropic_chunks.append({
+                            'type': 'content_block_delta',
+                            'index': idx,
+                            'delta': {
+                                'type': 'input_json_delta',
+                                'partial_json': func['arguments']
+                            }
+                        })
+
+        # Handle finish_reason
+        if 'finish_reason' in choice and choice['finish_reason']:
+            finish_reason = choice['finish_reason']
+            stop_reason_map = {
+                'stop': 'end_turn',
+                'length': 'max_tokens',
+                'tool_calls': 'tool_use',
+                'content_filter': 'stop_sequence',
+                'function_call': 'tool_use'
+            }
+            stop_reason = stop_reason_map.get(finish_reason, 'end_turn')
+
+            # Add usage if present
+            usage_data = None
+            if 'usage' in data:
+                usage_data = {
+                    'input_tokens': data['usage'].get('prompt_tokens', 0),
+                    'output_tokens': data['usage'].get('completion_tokens', 0)
+                }
+
+            anthropic_chunks.append({
+                'type': 'message_delta',
+                'delta': {'stop_reason': stop_reason},
+                'usage': usage_data or {'output_tokens': 0}
+            })
+            anthropic_chunks.append({'type': 'message_stop'})
+
+    # Ensure we have message_stop if not added
+    if anthropic_chunks and anthropic_chunks[-1].get('type') != 'message_stop':
+        anthropic_chunks.append({'type': 'message_stop'})
+
+    return anthropic_chunks
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_target_requests(path: str, request: Request):
@@ -372,22 +713,44 @@ async def proxy_target_requests(path: str, request: Request):
     incoming_json_body = {} # Initialize in case it's not a POST/JSON request
 
     # Determine if the current request path is a recognized generation endpoint
-    is_generation_request = path in GENERATION_ENDPOINTS
-    is_anthropic_request = path == "v1/messages" # Check if this is an Anthropic request
+    # Use suffix matching to handle paths with or without v1 prefix
+    is_generation_request = any(path.endswith(suffix) for suffix in GENERATION_ENDPOINT_SUFFIXES)
+    is_anthropic_request = path.endswith("v1/messages") # Check if this is an Anthropic request
     if ENABLE_DEBUG_LOGS:
         print(f"DEBUG: is_generation_request after check: {is_generation_request}")
         print(f"DEBUG: is_anthropic_request: {is_anthropic_request}")
 
-    # Construct the target URL for the OpenAI Compatible backend
-    # Redirect Anthropic requests to OpenAI chat completions endpoint
+    # Construct the target URL based on server capabilities
+    # Determine passthrough mode based on request format and server capabilities
+    should_passthrough_anthropic = is_anthropic_request and SERVER_SUPPORTS_ANTHROPIC
+    should_passthrough_openai = not is_anthropic_request and SERVER_SUPPORTS_OPENAI
+
     if is_anthropic_request:
-        # Convert /v1/messages to /chat/completions for OpenAI Compatible backend
-        # First apply the path transformation, then change to chat completions
-        transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
-        target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
-        if ENABLE_DEBUG_LOGS:
-            print(f"DEBUG: Redirecting Anthropic request from {original_path} to {target_path}")
+        if should_passthrough_anthropic:
+            # Keep Anthropic path as-is, no conversion
+            target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
+            if ENABLE_DEBUG_LOGS:
+                print(f"DEBUG: Anthropic passthrough mode - keeping path: {target_path}")
+        else:
+            # Convert /v1/messages to /chat/completions for OpenAI Compatible backend
+            # First apply the path transformation, then change to chat completions
+            transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
+            target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
+            if ENABLE_DEBUG_LOGS:
+                print(f"DEBUG: Converting Anthropic request from {original_path} to {target_path}")
     else:
+        if not SERVER_SUPPORTS_OPENAI:
+            # OpenAI request but server doesn't support OpenAI - we can't convert OpenAI to Anthropic
+            return Response(
+                content=json.dumps({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Server does not support OpenAI format requests. Only Anthropic format is supported."
+                    }
+                }),
+                status_code=400,
+                media_type="application/json"
+            )
         # Apply base path transformation
         target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
     
@@ -428,228 +791,243 @@ async def proxy_target_requests(path: str, request: Request):
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Parsed incoming JSON body: {incoming_json_body}")
 
-            # Handle Anthropic to OpenAI format conversion
+            # Handle Anthropic request based on server capabilities
             if is_anthropic_request:
-                if ENABLE_DEBUG_LOGS:
-                    print("DEBUG: Converting Anthropic request to OpenAI format.")
-                
-                try:
-                
-                    # Extract Anthropic format data
-                    anthropic_messages = incoming_json_body.get("messages", [])
-                    anthropic_model = incoming_json_body.get("model")
-                    anthropic_max_tokens = incoming_json_body.get("max_tokens")
-                    anthropic_temperature = incoming_json_body.get("temperature")
-                    anthropic_top_p = incoming_json_body.get("top_p")
-                    anthropic_stream = incoming_json_body.get("stream", False)
-                    anthropic_tools = incoming_json_body.get("tools")
-                    anthropic_tool_choice = incoming_json_body.get("tool_choice")
+                if should_passthrough_anthropic:
+                    # Passthrough mode: keep request as-is, but apply sampling params
+                    if ENABLE_DEBUG_LOGS:
+                        print("DEBUG: Anthropic passthrough mode - keeping request format")
+                    # Don't modify incoming_json_body - it stays as Anthropic format
+                else:
+                    # Convert Anthropic to OpenAI format
+                    if ENABLE_DEBUG_LOGS:
+                        print("DEBUG: Converting Anthropic request to OpenAI format.")
+
+                    try:
+
+                        # Extract Anthropic format data
+                        anthropic_messages = incoming_json_body.get("messages", [])
+                        anthropic_model = incoming_json_body.get("model")
+                        anthropic_max_tokens = incoming_json_body.get("max_tokens")
+                        anthropic_temperature = incoming_json_body.get("temperature")
+                        anthropic_top_p = incoming_json_body.get("top_p")
+                        anthropic_stream = incoming_json_body.get("stream", False)
+                        anthropic_tools = incoming_json_body.get("tools")
+                        anthropic_tool_choice = incoming_json_body.get("tool_choice")
                     
-                    # Convert Anthropic messages to OpenAI format
-                    openai_messages = []
-                    for msg_idx, msg in enumerate(anthropic_messages):
-                        try:
-                            # Map Anthropic roles to OpenAI roles
-                            anthropic_role = msg.get("role", "user")
-                            if anthropic_role == "user":
-                                openai_role = "user"
-                            elif anthropic_role == "assistant":
-                                openai_role = "assistant"
-                            elif anthropic_role == "system":
-                                openai_role = "system"
-                            else:
-                                # Default to user for unknown roles
-                                openai_role = "user"
-                                if ENABLE_DEBUG_LOGS:
-                                    print(f"DEBUG: Unknown Anthropic role '{anthropic_role}' mapped to 'user'")
-                            
-                            openai_msg = {
-                                "role": openai_role,
-                                "content": ""  # Initialize with empty string instead of None
-                            }
-                            
-                            # Handle complex Anthropic content format
-                            content = msg.get("content", [])
-                            if isinstance(content, list):
-                                content_parts = []
-                                tool_calls = []
-                                
-                                for content_item in content:
-                                    if isinstance(content_item, dict):
-                                        content_type = content_item.get("type")
-                                        
-                                        if content_type == "text":
-                                            text_content = content_item.get("text", "")
-                                            if text_content:
-                                                content_parts.append(text_content)
-                                        
-                                        elif content_type == "tool_use":
-                                            # Convert Anthropic tool_use to OpenAI tool_call format
-                                            tool_call = {
-                                                "id": content_item.get("id", f"call_{len(tool_calls)}"),
-                                                "type": "function",
-                                                "function": {
-                                                    "name": content_item.get("name", ""),
-                                                    "arguments": json.dumps(content_item.get("input", {}))
-                                                }
-                                            }
-                                            tool_calls.append(tool_call)
-                                            if ENABLE_DEBUG_LOGS:
-                                                print(f"DEBUG: Converted Anthropic tool_use to OpenAI tool_call: {tool_call}")
-                                        
-                                        elif content_type == "tool_result":
-                                            # Convert Anthropic tool_result to OpenAI tool call format
-                                            tool_result_id = content_item.get("tool_use_id")
-                                            result_content = content_item.get("content", "")
-                                            is_error = content_item.get("is_error", False)
-                                            
-                                            # Create a tool_call message with the result
-                                            if tool_result_id:
-                                                tool_call_msg = {
-                                                    "role": "tool",
-                                                    "tool_call_id": tool_result_id,
-                                                    "content": str(result_content) if result_content else "No content"
-                                                }
-                                                if is_error:
-                                                    tool_call_msg["content"] = f"Error: {result_content}"
-                                                
-                                                openai_messages.append(tool_call_msg)
-                                                if ENABLE_DEBUG_LOGS:
-                                                    print(f"DEBUG: Converted Anthropic tool_result to OpenAI tool message: {tool_call_msg}")
-                                    
-                                    elif isinstance(content_item, str):
-                                        content_parts.append(content_item)
-                                
-                                # Set content and tool_calls for the main message
-                                if content_parts:
-                                    openai_msg["content"] = "".join(content_parts)
+                        # Convert Anthropic messages to OpenAI format
+                        openai_messages = []
+                        for msg_idx, msg in enumerate(anthropic_messages):
+                            try:
+                                # Map Anthropic roles to OpenAI roles
+                                anthropic_role = msg.get("role", "user")
+                                if anthropic_role == "user":
+                                    openai_role = "user"
+                                elif anthropic_role == "assistant":
+                                    openai_role = "assistant"
+                                elif anthropic_role == "system":
+                                    openai_role = "system"
                                 else:
-                                    # If no content parts but there are tool calls, set content to null
-                                    # Otherwise set to empty string
-                                    openai_msg["content"] = None if tool_calls else ""
-                                
-                                if tool_calls:
-                                    openai_msg["tool_calls"] = tool_calls
-                            
-                            elif isinstance(content, str):
-                                openai_msg["content"] = content if content else ""
-                            elif content is None:
-                                openai_msg["content"] = ""
-                            else:
-                                openai_msg["content"] = str(content)
-                            
-                            # Validate the message before adding
-                            if openai_msg.get("role") != "tool" or "tool_call_id" in openai_msg:
-                                # Ensure content is never None for non-tool messages
-                                if openai_msg.get("content") is None and not openai_msg.get("tool_calls"):
-                                    openai_msg["content"] = ""
-                                
-                                # Only add if the message has valid content or tool calls
-                                if openai_msg.get("content") or openai_msg.get("tool_calls"):
-                                    openai_messages.append(openai_msg)
+                                    # Default to user for unknown roles
+                                    openai_role = "user"
                                     if ENABLE_DEBUG_LOGS:
-                                        print(f"DEBUG: Converted message {msg_idx}: {openai_msg}")
-                                else:
-                                    if ENABLE_DEBUG_LOGS:
-                                        print(f"DEBUG: Skipping empty message {msg_idx}")
-                            else:
-                                if ENABLE_DEBUG_LOGS:
-                                    print(f"DEBUG: Skipping invalid tool message {msg_idx}")
-                        
-                        except Exception as e:
-                            if ENABLE_DEBUG_LOGS:
-                                print(f"ERROR: Failed to convert message {msg_idx}: {e}")
-                            # Continue with next message instead of failing completely
-                            continue
-                    
-                    # Override model for Anthropic requests
-                    if OVERRIDE_MODEL_NAME:
-                        overridden_model = OVERRIDE_MODEL_NAME
-                        if ENABLE_OVERRIDE_LOGS:
-                            print(f"OVERRIDE: Anthropic model '{anthropic_model}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
-                    else:
-                        overridden_model = FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else anthropic_model
-                        if ENABLE_DEBUG_LOGS and FIRST_AVAILABLE_MODEL:
-                            print(f"DEBUG: Using first available model '{FIRST_AVAILABLE_MODEL}' for Anthropic request")
-                    
-                    # Convert to OpenAI chat completions format
-                    openai_request = {
-                        "model": overridden_model,
-                        "messages": openai_messages,
-                        "max_tokens": anthropic_max_tokens,
-                        "stream": anthropic_stream
-                    }
-                    
-                    # Add optional parameters if present
-                    if anthropic_temperature is not None:
-                        openai_request["temperature"] = anthropic_temperature
-                    if anthropic_top_p is not None:
-                        openai_request["top_p"] = anthropic_top_p
-                    
-                    # Convert tools if present
-                    if anthropic_tools:
-                        openai_tools = []
-                        for tool in anthropic_tools:
-                            openai_tool = {
-                                "type": "function",
-                                "function": {
-                                    "name": tool.get("name"),
-                                    "description": tool.get("description", ""),
-                                    "parameters": tool.get("input_schema", {})
+                                        print(f"DEBUG: Unknown Anthropic role '{anthropic_role}' mapped to 'user'")
+                            
+                                openai_msg = {
+                                    "role": openai_role,
+                                    "content": ""  # Initialize with empty string instead of None
                                 }
-                            }
-                            openai_tools.append(openai_tool)
+                            
+                                # Handle complex Anthropic content format
+                                content = msg.get("content", [])
+                                if isinstance(content, list):
+                                    content_parts = []
+                                    tool_calls = []
+                                
+                                    for content_item in content:
+                                        if isinstance(content_item, dict):
+                                            content_type = content_item.get("type")
+                                        
+                                            if content_type == "text":
+                                                text_content = content_item.get("text", "")
+                                                if text_content:
+                                                    content_parts.append(text_content)
+                                        
+                                            elif content_type == "tool_use":
+                                                # Convert Anthropic tool_use to OpenAI tool_call format
+                                                tool_call = {
+                                                    "id": content_item.get("id", f"call_{len(tool_calls)}"),
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": content_item.get("name", ""),
+                                                        "arguments": json.dumps(content_item.get("input", {}))
+                                                    }
+                                                }
+                                                tool_calls.append(tool_call)
+                                                if ENABLE_DEBUG_LOGS:
+                                                    print(f"DEBUG: Converted Anthropic tool_use to OpenAI tool_call: {tool_call}")
+                                        
+                                            elif content_type == "tool_result":
+                                                # Convert Anthropic tool_result to OpenAI tool call format
+                                                tool_result_id = content_item.get("tool_use_id")
+                                                result_content = content_item.get("content", "")
+                                                is_error = content_item.get("is_error", False)
+                                            
+                                                # Create a tool_call message with the result
+                                                if tool_result_id:
+                                                    tool_call_msg = {
+                                                        "role": "tool",
+                                                        "tool_call_id": tool_result_id,
+                                                        "content": str(result_content) if result_content else "No content"
+                                                    }
+                                                    if is_error:
+                                                        tool_call_msg["content"] = f"Error: {result_content}"
+                                                
+                                                    openai_messages.append(tool_call_msg)
+                                                    if ENABLE_DEBUG_LOGS:
+                                                        print(f"DEBUG: Converted Anthropic tool_result to OpenAI tool message: {tool_call_msg}")
+                                    
+                                        elif isinstance(content_item, str):
+                                            content_parts.append(content_item)
+                                
+                                    # Set content and tool_calls for the main message
+                                    if content_parts:
+                                        openai_msg["content"] = "".join(content_parts)
+                                    else:
+                                        # If no content parts but there are tool calls, set content to null
+                                        # Otherwise set to empty string
+                                        openai_msg["content"] = None if tool_calls else ""
+                                
+                                    if tool_calls:
+                                        openai_msg["tool_calls"] = tool_calls
+                            
+                                elif isinstance(content, str):
+                                    openai_msg["content"] = content if content else ""
+                                elif content is None:
+                                    openai_msg["content"] = ""
+                                else:
+                                    openai_msg["content"] = str(content)
+                            
+                                # Validate the message before adding
+                                if openai_msg.get("role") != "tool" or "tool_call_id" in openai_msg:
+                                    # Ensure content is never None for non-tool messages
+                                    if openai_msg.get("content") is None and not openai_msg.get("tool_calls"):
+                                        openai_msg["content"] = ""
+                                
+                                    # Only add if the message has valid content or tool calls
+                                    if openai_msg.get("content") or openai_msg.get("tool_calls"):
+                                        openai_messages.append(openai_msg)
+                                        if ENABLE_DEBUG_LOGS:
+                                            print(f"DEBUG: Converted message {msg_idx}: {openai_msg}")
+                                    else:
+                                        if ENABLE_DEBUG_LOGS:
+                                            print(f"DEBUG: Skipping empty message {msg_idx}")
+                                else:
+                                    if ENABLE_DEBUG_LOGS:
+                                        print(f"DEBUG: Skipping invalid tool message {msg_idx}")
                         
-                        openai_request["tools"] = openai_tools
-                        if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Converted {len(anthropic_tools)} Anthropic tools to OpenAI format")
+                            except Exception as e:
+                                if ENABLE_DEBUG_LOGS:
+                                    print(f"ERROR: Failed to convert message {msg_idx}: {e}")
+                                # Continue with next message instead of failing completely
+                                continue
                     
-                    # Convert tool_choice if present
-                    if anthropic_tool_choice:
-                        if anthropic_tool_choice == "auto":
-                            openai_request["tool_choice"] = "auto"
-                        elif anthropic_tool_choice == "none":
-                            openai_request["tool_choice"] = "none"
-                        elif isinstance(anthropic_tool_choice, dict):
-                            # Handle specific tool choice
-                            tool_name = anthropic_tool_choice.get("name")
-                            if tool_name:
-                                openai_request["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
-                        if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Converted tool_choice: {anthropic_tool_choice} -> {openai_request.get('tool_choice')}")
+                        # Override model for Anthropic requests
+                        if OVERRIDE_MODEL_NAME:
+                            overridden_model = OVERRIDE_MODEL_NAME
+                            if ENABLE_OVERRIDE_LOGS:
+                                print(f"OVERRIDE: Anthropic model '{anthropic_model}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
+                        else:
+                            overridden_model = FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else anthropic_model
+                            if ENABLE_DEBUG_LOGS and FIRST_AVAILABLE_MODEL:
+                                print(f"DEBUG: Using first available model '{FIRST_AVAILABLE_MODEL}' for Anthropic request")
+                    
+                        # Convert to OpenAI chat completions format
+                        openai_request = {
+                            "model": overridden_model,
+                            "messages": openai_messages,
+                            "max_tokens": anthropic_max_tokens,
+                            "stream": anthropic_stream
+                        }
+                    
+                        # Add optional parameters if present
+                        if anthropic_temperature is not None:
+                            openai_request["temperature"] = anthropic_temperature
+                        if anthropic_top_p is not None:
+                            openai_request["top_p"] = anthropic_top_p
+                    
+                        # Convert tools if present
+                        if anthropic_tools:
+                            openai_tools = []
+                            for tool in anthropic_tools:
+                                openai_tool = {
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool.get("name"),
+                                        "description": tool.get("description", ""),
+                                        "parameters": tool.get("input_schema", {})
+                                    }
+                                }
+                                openai_tools.append(openai_tool)
+                        
+                            openai_request["tools"] = openai_tools
+                            if ENABLE_DEBUG_LOGS:
+                                print(f"DEBUG: Converted {len(anthropic_tools)} Anthropic tools to OpenAI format")
+                    
+                        # Convert tool_choice if present
+                        if anthropic_tool_choice:
+                            if anthropic_tool_choice == "auto":
+                                openai_request["tool_choice"] = "auto"
+                            elif anthropic_tool_choice == "none":
+                                openai_request["tool_choice"] = "none"
+                            elif isinstance(anthropic_tool_choice, dict):
+                                # Handle specific tool choice
+                                tool_name = anthropic_tool_choice.get("name")
+                                if tool_name:
+                                    openai_request["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
+                            if ENABLE_DEBUG_LOGS:
+                                print(f"DEBUG: Converted tool_choice: {anthropic_tool_choice} -> {openai_request.get('tool_choice')}")
                 
-                    # Validate the converted messages before proceeding
-                    if not openai_messages:
+                        # Validate the converted messages before proceeding
+                        if not openai_messages:
+                            if ENABLE_DEBUG_LOGS:
+                                print("ERROR: No valid messages after conversion. Creating fallback message.")
+                            # Create a simple fallback message
+                            openai_messages = [{
+                                "role": "user",
+                                "content": "Please provide a response."
+                            }]
+                    
+                        # Replace the incoming body with converted OpenAI format
+                        incoming_json_body = openai_request
                         if ENABLE_DEBUG_LOGS:
-                            print("ERROR: No valid messages after conversion. Creating fallback message.")
-                        # Create a simple fallback message
-                        openai_messages = [{
-                            "role": "user",
-                            "content": "Please provide a response."
-                        }]
-                    
-                    # Replace the incoming body with converted OpenAI format
-                    incoming_json_body = openai_request
-                    if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Converted to OpenAI format: {incoming_json_body}")
-                        print(f"DEBUG: Final message count: {len(openai_messages)}")
+                            print(f"DEBUG: Converted to OpenAI format: {incoming_json_body}")
+                            print(f"DEBUG: Final message count: {len(openai_messages)}")
                 
-                except Exception as e:
-                    print(f"ERROR: Failed to convert Anthropic request to OpenAI format: {e}")
-                    if ENABLE_DEBUG_LOGS:
-                        print(f"ERROR: Original Anthropic request: {incoming_json_body}")
+                    except Exception as e:
+                        print(f"ERROR: Failed to convert Anthropic request to OpenAI format: {e}")
+                        if ENABLE_DEBUG_LOGS:
+                            print(f"ERROR: Original Anthropic request: {incoming_json_body}")
                     
-                    # Create a minimal valid OpenAI request as fallback
-                    fallback_model = OVERRIDE_MODEL_NAME if OVERRIDE_MODEL_NAME else (FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else "gpt-3.5-turbo")
-                    incoming_json_body = {
-                        "model": fallback_model,
-                        "messages": [{"role": "user", "content": "Conversion failed. Please respond."}],
-                        "max_tokens": anthropic_max_tokens if 'anthropic_max_tokens' in locals() else 1000,
-                        "stream": anthropic_stream if 'anthropic_stream' in locals() else False
-                    }
+                        # Create a minimal valid OpenAI request as fallback
+                        fallback_model = OVERRIDE_MODEL_NAME if OVERRIDE_MODEL_NAME else (FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else "gpt-3.5-turbo")
+                        incoming_json_body = {
+                            "model": fallback_model,
+                            "messages": [{"role": "user", "content": "Conversion failed. Please respond."}],
+                            "max_tokens": anthropic_max_tokens if 'anthropic_max_tokens' in locals() else 1000,
+                            "stream": anthropic_stream if 'anthropic_stream' in locals() else False
+                        }
                     
-                    if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Using fallback OpenAI request: {incoming_json_body}")
+                        if ENABLE_DEBUG_LOGS:
+                            print(f"DEBUG: Using fallback OpenAI request: {incoming_json_body}")
+
+            # Apply model name override for Anthropic requests in passthrough mode
+            if is_anthropic_request and should_passthrough_anthropic:
+                if OVERRIDE_MODEL_NAME:
+                    original_model_name = incoming_json_body.get("model")
+                    incoming_json_body["model"] = OVERRIDE_MODEL_NAME
+                    if ENABLE_OVERRIDE_LOGS:
+                        print(f"OVERRIDE: Anthropic passthrough model '{original_model_name}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
 
             # Get the model name from the request
             model_name = incoming_json_body.get("model")
@@ -799,6 +1177,367 @@ async def proxy_target_requests(path: str, request: Request):
                     if ENABLE_DEBUG_LOGS:
                         print(f"DEBUG: Not an OpenAI-compatible streaming path, keeping original Content-Type: {response_headers.get('content-type', 'N/A')}")
 
+                # For streaming with validation in passthrough mode, buffer and validate first
+                # Note: openai_convert streaming validation not yet supported (chunks are converted on-the-fly)
+                if (is_anthropic_request and
+                    should_passthrough_anthropic and
+                    VALIDATION_CONFIG.get("enabled", False)):
+
+                    # Capture outer scope variable to avoid UnboundLocalError
+                    initial_response = target_response
+
+                    async def buffered_stream_with_validation():
+                        nonlocal initial_response
+                        max_retries = VALIDATION_CONFIG.get("max_retries", 3)
+                        # Total attempts = 1 (initial) + max_retries
+                        max_attempts = 1 + max_retries
+                        attempt = 0
+                        current_response = initial_response
+
+                        while attempt < max_attempts:
+                            attempt += 1
+
+                            # Buffer all chunks
+                            chunks = []
+                            async for chunk in current_response.aiter_bytes():
+                                chunks.append(chunk)
+
+                            await current_response.aclose()
+
+                            # Reconstruct response for validation
+                            full_content = b''.join(chunks)
+                            try:
+                                response_text = full_content.decode('utf-8')
+                                # Parse SSE to get final response
+                                response_dict = parse_sse_to_response(response_text)
+
+                                if response_dict:
+                                    print(f"VALIDATION: [Anthropic passthrough streaming] validating response id={response_dict.get('id', 'unknown')}")
+                                    validation_result = await validate_response(response_dict, VALIDATION_CONFIG)
+
+                                    if validation_result.error:
+                                        print(f"WARNING: Validator error: {validation_result.error}")
+                                        # Pass through on validator error
+                                        for chunk in chunks:
+                                            yield chunk
+                                        return
+
+                                    if validation_result.is_valid:
+                                        if ENABLE_DEBUG_LOGS:
+                                            print(f"DEBUG: Streaming response validated (attempt {attempt})")
+                                        # Replay buffered chunks
+                                        for chunk in chunks:
+                                            yield chunk
+                                        return
+
+                                    # Invalid - will retry
+                                    print(f"VALIDATION FAILED: {validation_result.issue_type} (confidence: {validation_result.confidence}, attempt: {attempt})")
+
+                                    if attempt >= max_attempts:
+                                        # Return error message as stream using proper Anthropic SSE format
+                                        saved_path = save_failed_response(response_dict, validation_result, attempt)
+                                        error_response = create_error_message(validation_result.issue_type, saved_path)
+
+                                        # Build proper SSE stream with message_start, content blocks, and message_stop
+                                        # 1. message_start event
+                                        message_start = {"type": "message_start", "message": error_response}
+                                        yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n".encode()
+
+                                        # 2. content_block_start for the text block
+                                        content_block_start = {
+                                            "type": "content_block_start",
+                                            "index": 0,
+                                            "content_block": {"type": "text", "text": ""}
+                                        }
+                                        yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n".encode()
+
+                                        # 3. content_block_delta with the error text
+                                        error_text = error_response["content"][0]["text"]
+                                        content_block_delta = {
+                                            "type": "content_block_delta",
+                                            "index": 0,
+                                            "delta": {"type": "text_delta", "text": error_text}
+                                        }
+                                        yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n".encode()
+
+                                        # 4. content_block_stop
+                                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n".encode()
+
+                                        # 5. message_delta with stop_reason
+                                        message_delta = {
+                                            "type": "message_delta",
+                                            "delta": {"stop_reason": "end_turn"},
+                                            "usage": {"output_tokens": 0}
+                                        }
+                                        yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n".encode()
+
+                                        # 6. message_stop
+                                        yield b"event: message_stop\ndata: {}\n\n"
+
+                                        print(f"VALIDATION FAILED: Max attempts ({max_attempts}) reached")
+                                        return
+
+                                    # Retry with backoff
+                                    delay = await calculate_retry_delay(attempt, VALIDATION_CONFIG)
+                                    if delay > 0:
+                                        print(f"Retrying in {delay}s (attempt {attempt + 1}/{max_attempts})")
+                                        await asyncio.sleep(delay)
+
+                                    # Make retry request
+                                    retry_response = await client.request(
+                                        method="POST",
+                                        url=target_url,
+                                        headers=headers,
+                                        content=request_content,
+                                    )
+
+                                    if retry_response.status_code == 200:
+                                        current_response = retry_response
+                                        continue
+                                    else:
+                                        # Retry request failed, use last response
+                                        print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        await retry_response.aclose()
+                                        for chunk in chunks:
+                                            yield chunk
+                                        return
+                                else:
+                                    # Can't parse SSE, pass through
+                                    for chunk in chunks:
+                                        yield chunk
+                                    return
+
+                            except Exception as e:
+                                print(f"ERROR during streaming validation: {e}")
+                                for chunk in chunks:
+                                    yield chunk
+                                return
+
+                    return StreamingResponse(
+                        buffered_stream_with_validation(),
+                        status_code=target_response.status_code,
+                        headers=response_headers,
+                        media_type=response_headers.get("content-type"),
+                    )
+
+                # For streaming with validation in openai_convert mode, buffer OpenAI chunks,
+                # validate (validator handles both formats), then stream converted chunks
+                if (is_anthropic_request and
+                    not should_passthrough_anthropic and
+                    VALIDATION_CONFIG.get("enabled", False)):
+
+                    # Capture outer scope variable to avoid UnboundLocalError
+                    initial_openai_response = target_response
+
+                    async def buffered_openai_stream_with_validation():
+                        nonlocal initial_openai_response
+                        max_retries = VALIDATION_CONFIG.get("max_retries", 3)
+                        # Total attempts = 1 (initial) + max_retries
+                        max_attempts = 1 + max_retries
+                        attempt = 0
+                        current_response = initial_openai_response
+
+                        while attempt < max_attempts:
+                            attempt += 1
+
+                            # Buffer all OpenAI chunks
+                            chunks = []
+                            async for chunk in current_response.aiter_bytes():
+                                chunks.append(chunk)
+
+                            await current_response.aclose()
+
+                            # Reconstruct OpenAI response for validation
+                            full_content = b''.join(chunks)
+                            try:
+                                response_text = full_content.decode('utf-8')
+                                # Parse OpenAI SSE to get response dict
+                                openai_response = parse_openai_sse_to_response(response_text)
+
+                                if openai_response:
+                                    # Validate directly - validator handles OpenAI format
+                                    print(f"VALIDATION: [OpenAI convert streaming] validating response id={openai_response.get('id', 'unknown')}")
+                                    validation_result = await validate_response(openai_response, VALIDATION_CONFIG)
+
+                                    if validation_result.error:
+                                        print(f"WARNING: Validator error: {validation_result.error}")
+                                        # Convert and stream on validator error
+                                        anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
+                                        for ac in anthropic_chunks:
+                                            yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
+                                        return
+
+                                    if validation_result.is_valid:
+                                        if ENABLE_DEBUG_LOGS:
+                                            print(f"DEBUG: Streaming response validated (attempt {attempt})")
+                                        # Convert OpenAI SSE to Anthropic SSE and stream
+                                        anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
+                                        for ac in anthropic_chunks:
+                                            yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
+                                        return
+
+                                    # Invalid - log and retry
+                                    print(f"VALIDATION FAILED: {validation_result.issue_type} (confidence: {validation_result.confidence}, attempt: {attempt})")
+
+                                    if attempt >= max_attempts:
+                                        # Return error message as stream
+                                        saved_path = save_failed_response(openai_response, validation_result, attempt)
+                                        error_response = create_error_message(validation_result.issue_type, saved_path)
+                                        error_event = f"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{json.dumps(error_response)}}}\n\n"
+                                        yield error_event.encode()
+                                        yield b"event: message_stop\ndata: {}\n\n"
+                                        print(f"VALIDATION FAILED: Max attempts ({max_attempts}) reached")
+                                        return
+
+                                    # Retry with backoff
+                                    delay = await calculate_retry_delay(attempt, VALIDATION_CONFIG)
+                                    if delay > 0:
+                                        print(f"Retrying in {delay}s (attempt {attempt + 1}/{max_attempts})")
+                                        await asyncio.sleep(delay)
+
+                                    # Make retry request
+                                    retry_response = await client.request(
+                                        method="POST",
+                                        url=target_url,
+                                        headers=headers,
+                                        content=request_content,
+                                    )
+
+                                    if retry_response.status_code == 200:
+                                        current_response = retry_response
+                                        continue
+                                    else:
+                                        # Retry request failed, convert and stream last response
+                                        print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        await retry_response.aclose()
+                                        anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
+                                        for ac in anthropic_chunks:
+                                            yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
+                                        return
+                                else:
+                                    # Can't parse OpenAI SSE, pass through original chunks
+                                    for chunk in chunks:
+                                        yield chunk
+                                    return
+
+                            except Exception as e:
+                                print(f"ERROR during OpenAI streaming validation: {e}")
+                                for chunk in chunks:
+                                    yield chunk
+                                return
+
+                    return StreamingResponse(
+                        buffered_openai_stream_with_validation(),
+                        status_code=target_response.status_code,
+                        headers=response_headers,
+                        media_type=response_headers.get("content-type"),
+                    )
+
+                # For streaming with validation in OpenAI passthrough mode
+                if (not is_anthropic_request and
+                    should_passthrough_openai and
+                    VALIDATION_CONFIG.get("enabled", False)):
+
+                    async def buffered_openai_passthrough_stream_with_validation():
+                        max_retries = VALIDATION_CONFIG.get("max_retries", 3)
+                        # Total attempts = 1 (initial) + max_retries
+                        max_attempts = 1 + max_retries
+
+                        attempt = 0
+                        current_response = target_response
+
+                        while attempt < max_attempts:
+                            attempt += 1
+
+                            # Buffer all chunks
+                            chunks = []
+                            async for chunk in current_response.aiter_bytes():
+                                chunks.append(chunk)
+
+                            await current_response.aclose()
+
+                            # Reconstruct response for validation
+                            full_content = b''.join(chunks)
+                            try:
+                                response_text = full_content.decode('utf-8')
+                                # Parse OpenAI SSE to get response dict
+                                openai_response = parse_openai_sse_to_response(response_text)
+
+                                if openai_response:
+                                    print(f"VALIDATION: [OpenAI passthrough streaming] validating response id={openai_response.get('id', 'unknown')}")
+                                    validation_result = await validate_response(openai_response, VALIDATION_CONFIG)
+
+                                    if validation_result.error:
+                                        print(f"WARNING: Validator error: {validation_result.error}")
+                                        for chunk in chunks:
+                                            yield chunk
+                                        return
+
+                                    if validation_result.is_valid:
+                                        if ENABLE_VALIDATION_LOGS:
+                                            print(f"VALIDATION: OpenAI streaming response validated (attempt {attempt})")
+                                        for chunk in chunks:
+                                            yield chunk
+                                        return
+
+                                    # Invalid - log and retry if we have retries left
+                                    print(f"VALIDATION FAILED: {validation_result.issue_type} (confidence: {validation_result.confidence}, attempt: {attempt})")
+
+                                    if attempt >= max_attempts:
+                                        # Return error message as stream
+                                        saved_path = save_failed_response(openai_response, validation_result, attempt)
+                                        error_response = create_error_message(validation_result.issue_type, saved_path)
+                                        # Extract the text content for OpenAI format
+                                        error_text = error_response["content"][0]["text"]
+                                        # Return as OpenAI-style error stream
+                                        error_chunk = {"id": "error", "choices": [{"delta": {"content": error_text}}]}
+                                        yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                                        yield b"data: [DONE]\n\n"
+                                        print(f"VALIDATION FAILED: Max attempts ({max_attempts}) reached")
+                                        return
+
+                                    # Retry with backoff
+                                    delay = await calculate_retry_delay(attempt, VALIDATION_CONFIG)
+                                    if delay > 0:
+                                        print(f"Retrying in {delay}s (attempt {attempt + 1}/{max_attempts})")
+                                        await asyncio.sleep(delay)
+
+                                    # Make retry request
+                                    retry_response = await client.request(
+                                        method="POST",
+                                        url=target_url,
+                                        headers=headers,
+                                        content=request_content,
+                                    )
+
+                                    if retry_response.status_code == 200:
+                                        current_response = retry_response
+                                        continue
+                                    else:
+                                        print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        await retry_response.aclose()
+                                        for chunk in chunks:
+                                            yield chunk
+                                        return
+                                else:
+                                    # Can't parse OpenAI SSE, pass through
+                                    for chunk in chunks:
+                                        yield chunk
+                                    return
+
+                            except Exception as e:
+                                print(f"ERROR during OpenAI passthrough streaming validation: {e}")
+                                for chunk in chunks:
+                                    yield chunk
+                                return
+
+                    return StreamingResponse(
+                        buffered_openai_passthrough_stream_with_validation(),
+                        status_code=target_response.status_code,
+                        headers=response_headers,
+                        media_type=response_headers.get("content-type"),
+                    )
+
                 # Define a local async generator to yield chunks and close the httpx response
                 async def stream_and_close_response():
                     chunk_count = 0
@@ -806,8 +1545,8 @@ async def proxy_target_requests(path: str, request: Request):
                         async for chunk in target_response.aiter_bytes():
                             chunk_count += 1
                             
-                            # Convert OpenAI streaming response to Anthropic format if needed
-                            if is_anthropic_request and chunk:
+                            # Convert OpenAI streaming response to Anthropic format only in convert mode
+                            if is_anthropic_request and not should_passthrough_anthropic and chunk:
                                 try:
                                     chunk_str = chunk.decode('utf-8')
                                     if chunk_str.startswith('data: ') and not chunk_str.startswith('data: [DONE]'):
@@ -946,8 +1685,8 @@ async def proxy_target_requests(path: str, request: Request):
                         print(f"WARNING: Anthropic request to {target_path} returned 404. OpenAI Compatible backend may not support OpenAI chat completions endpoint.")
                     else:
                         print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on OpenAI Compatible backend.")
-                
-                if is_anthropic_request and target_response.status_code == 200:
+
+                if is_anthropic_request and not should_passthrough_anthropic and target_response.status_code == 200:
                     try:
                         openai_response = json.loads(response_content.decode('utf-8'))
                         
@@ -1018,7 +1757,82 @@ async def proxy_target_requests(path: str, request: Request):
                         if ENABLE_DEBUG_LOGS:
                             print(f"DEBUG: Could not convert response to Anthropic format: {e}. Using original response.")
                         # Keep original response if conversion fails
-                
+
+                elif is_anthropic_request and should_passthrough_anthropic:
+                    if ENABLE_DEBUG_LOGS:
+                        print("DEBUG: Anthropic passthrough mode - keeping response format")
+                elif not is_anthropic_request and should_passthrough_openai:
+                    if ENABLE_DEBUG_LOGS:
+                        print("DEBUG: OpenAI passthrough mode - keeping response format")
+
+                # Validation logic for all modes (anthropic passthrough, openai convert, openai passthrough)
+                if (VALIDATION_CONFIG.get("enabled", False) and
+                    target_response.status_code == 200):
+
+                    max_retries = VALIDATION_CONFIG.get("max_retries", 3)
+                    # Total attempts = 1 (initial) + max_retries
+                    max_attempts = 1 + max_retries
+                    attempt = 0
+
+                    while attempt < max_attempts:
+                        attempt += 1
+
+                        # Parse response for validation
+                        try:
+                            response_dict = json.loads(response_content.decode('utf-8'))
+                        except json.JSONDecodeError:
+                            # Can't validate non-JSON, pass through
+                            break
+
+                        # Validate response
+                        print(f"VALIDATION: [Non-streaming] validating response id={response_dict.get('id', 'unknown')}")
+                        validation_result = await validate_response(response_dict, VALIDATION_CONFIG)
+
+                        if validation_result.error:
+                            # Validator failed, log and pass through
+                            print(f"WARNING: Validator error: {validation_result.error}")
+                            break
+
+                        if validation_result.is_valid:
+                            # Valid response, proceed
+                            if ENABLE_DEBUG_LOGS:
+                                print(f"DEBUG: Response validated successfully (attempt {attempt})")
+                            break
+
+                        # Invalid response - log and retry
+                        print(f"VALIDATION FAILED: {validation_result.issue_type} (confidence: {validation_result.confidence}, attempt: {attempt})")
+
+                        if attempt >= max_attempts:
+                            # Max attempts reached, return error message
+                            saved_path = save_failed_response(response_dict, validation_result, attempt)
+                            error_response = create_error_message(validation_result.issue_type, saved_path)
+                            response_content = json.dumps(error_response).encode('utf-8')
+                            print(f"VALIDATION FAILED: Max attempts ({max_attempts}) reached")
+                            break
+
+                        # Retry with backoff
+                        delay = await calculate_retry_delay(attempt, VALIDATION_CONFIG)
+                        if delay > 0:
+                            print(f"Retrying in {delay}s (attempt {attempt + 1}/{max_attempts})")
+                            await asyncio.sleep(delay)
+
+                        # Make retry request
+                        retry_response = await client.request(
+                            method="POST",
+                            url=target_url,
+                            headers=headers,
+                            content=request_content,
+                        )
+
+                        if retry_response.status_code == 200:
+                            response_content = retry_response.content
+                            await retry_response.aclose()
+                        else:
+                            # Retry request failed, use last response
+                            print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                            await retry_response.aclose()
+                            break
+
                 # Ensure the httpx response is closed after its content is read
                 await target_response.aclose()
                 
@@ -1151,7 +1965,8 @@ if __name__ == "__main__":
     TARGET_BASE_PATH = extract_base_path(TARGET_BASE_URL)
     ENABLE_DEBUG_LOGS = args.debug_logs if args.debug_logs is not None else CONFIG["logging"]["enable_debug_logs"]
     ENABLE_OVERRIDE_LOGS = args.override_logs if args.override_logs is not None else CONFIG["logging"]["enable_override_logs"]
-    
+    ENABLE_VALIDATION_LOGS = CONFIG["logging"].get("enable_validation_logs", False)
+
     # Load sampling parameters from config
     DEFAULT_SAMPLING_PARAMS = CONFIG["default_sampling_params"]
     OVERRIDE_CONFIG = CONFIG["override"]
@@ -1159,7 +1974,14 @@ if __name__ == "__main__":
     OVERRIDE_MODEL_NAME = OVERRIDE_CONFIG.get("model_name")
     OVERRIDE_SAMPLING_PARAMS = OVERRIDE_CONFIG.get("sampling_params", {})
     MODEL_SAMPLING_PARAMS = CONFIG["model_sampling_params"]
-    
+
+    # Load server capabilities from server config
+    server_config = CONFIG.get("server", {})
+    SERVER_SUPPORTS_OPENAI = server_config.get("supports_openai", True)
+    SERVER_SUPPORTS_ANTHROPIC = server_config.get("supports_anthropic", False)
+    VALIDATION_CONFIG = CONFIG.get("validation", {"enabled": False})
+    VALIDATION_CONFIG["enable_validation_logs"] = ENABLE_VALIDATION_LOGS
+
     # Parse override parameters from command line if provided (takes precedence over config)
     if args.override_sampling_params:
         try:
@@ -1187,6 +2009,8 @@ if __name__ == "__main__":
 
     print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
     print(f"Proxying requests to OpenAI Compatible backend at {TARGET_BASE_URL}")
+    print(f"Server capabilities: OpenAI={SERVER_SUPPORTS_OPENAI}, Anthropic={SERVER_SUPPORTS_ANTHROPIC}")
     print(f"Debug logs are {'ENABLED' if ENABLE_DEBUG_LOGS else 'DISABLED'}.")
     print(f"Override logs are {'ENABLED' if ENABLE_OVERRIDE_LOGS else 'DISABLED'}.")
+    print(f"Validation logs are {'ENABLED' if ENABLE_VALIDATION_LOGS else 'DISABLED'}.")
     uvicorn.run(app, host=SAMPLING_PROXY_HOST, port=SAMPLING_PROXY_PORT)

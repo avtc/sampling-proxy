@@ -1,0 +1,36 @@
+{
+  "server": {
+    "target_base_url": "https://api.z.ai/api/anthropic",
+    "sampling_proxy_base_path": "",
+    "sampling_proxy_host": "0.0.0.0",
+    "sampling_proxy_port": 8001,
+    "timeout_seconds": 1200.0,
+    "supports_openai": false,
+    "supports_anthropic": true
+  },
+  "logging": {
+    "enable_debug_logs": false,
+    "enable_override_logs": false,
+    "enable_validation_logs": true
+  },
+  "default_sampling_params": {},
+  "override": {
+    "only_anthropic": false,
+    "model_name": null,
+    "sampling_params": {}
+  },
+  "model_sampling_params": {},
+  "validation": {
+    "enabled": true,
+    "validator_url": "http://127.0.0.1:1234",
+    "validator_model": "qwen-3.5-0.8b",
+    "supports_openai": true,
+    "supports_anthropic": true,
+    "connect_timeout_seconds": 5.0,
+    "timeout_seconds": 300.0,
+    "max_retries": 3,
+    "retry_base_delay_seconds": 1.0,
+    "retry_multiplier": 2.0,
+    "confidence_threshold": 0.85
+  }
+}

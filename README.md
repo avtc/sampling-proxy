@@ -244,3 +244,83 @@ For convenience, use the provided scripts to start the proxy with the correct vi
 ```
 
 Both scripts will automatically activate the `sampling_proxy` virtual environment and start the proxy server.
+
+## Garbage Detection Mode
+
+The proxy can validate AI responses using a local or remote model with OpenAI-compatible or Anthropic-compatible API, and automatically retry when garbage output is detected.
+
+### Features
+
+- **Repetition detection**: Catches loops where the same phrase is repeated 3+ times
+- **Truncation detection**: Identifies responses that cut off mid-sentence
+- **Malformed tool calls**: Detects invalid JSON in tool use blocks
+- **Auto-retry**: Automatically retries with exponential backoff (1s, 2s delays)
+- **Fail-open**: If validator is unavailable, responses pass through unmodified
+- **Both backend modes**: Works with `openai_convert` and `anthropic_passthrough` modes
+- **Flexible validator API**: Supports both Anthropic and OpenAI API formats
+
+### Validation Support by Mode
+
+| Mode | Non-streaming | Streaming |
+|------|---------------|-----------|
+| `anthropic_passthrough` | ✅ Full support | ✅ Full support |
+| `openai_convert` | ✅ Full support | ✅ Full support |
+
+**Note**: Streaming validation works by buffering the entire response, validating, then streaming to the client. This adds latency but ensures garbage detection for all response types.
+
+### Setup
+
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. Start a validator endpoint with a small model (e.g., Qwen 3.5 0.8B, or any model that can classify text)
+   - Can use LM Studio, Ollama, vLLM, or any OpenAI/Anthropic-compatible server
+
+3. Copy the sample config:
+   ```bash
+   cp config_zai_sample.json config.json
+   ```
+
+4. Edit `config.json` to configure validation:
+   - `validation.validator_url`: Validator endpoint URL (default: http://127.0.0.1:1234)
+   - `validation.validator_model`: Model name at the validator endpoint
+   - `validation.validator_api_format`: API format - `"anthropic"` or `"openai"`
+   - `validation.validator_timeout_seconds`: Request timeout (default: 30.0)
+   - `validation.max_retries`: Max retry attempts (default: 3)
+
+5. Start the proxy:
+   ```bash
+   python sampling_proxy.py
+   ```
+
+6. Configure Claude Code to use the proxy as your API endpoint:
+   - Base URL: `http://localhost:8001`
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `server.supports_openai` | Backend supports OpenAI format requests | `true` |
+| `server.supports_anthropic` | Backend supports Anthropic format requests | `false` |
+| `server.connect_timeout_seconds` | Connection timeout for backend | `5.0` |
+| `server.timeout_seconds` | Read timeout for backend (per chunk) | `1200.0` |
+| `logging.enable_debug_logs` | Enable debug logs | `false` |
+| `logging.enable_override_logs` | Enable sampling param override logs | `false` |
+| `logging.enable_validation_logs` | Enable validation process logs | `false` |
+| `validation.enabled` | Enable response validation | `false` |
+| `validation.validator_url` | Validator endpoint URL | `http://127.0.0.1:1234` |
+| `validation.validator_model` | Model name for validation | `qwen-3.5-0.8b` |
+| `validation.supports_openai` | Validator supports OpenAI format | `true` |
+| `validation.supports_anthropic` | Validator supports Anthropic format | `false` |
+| `validation.connect_timeout_seconds` | Connection timeout for validator | `5.0` |
+| `validation.timeout_seconds` | Read timeout for validator | `300.0` |
+| `validation.max_retries` | Max retry attempts | `3` |
+| `validation.retry_base_delay_seconds` | Initial retry delay | `1.0` |
+| `validation.retry_multiplier` | Backoff multiplier | `2.0` |
+
+### Logs and Failed Responses
+
+- Validation failures are logged to `~/.cache/garbage-proxy/logs/`
+- Failed responses are saved to `~/.cache/garbage-proxy/failed/`
