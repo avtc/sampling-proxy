@@ -1,0 +1,17 @@
+{
+  "planPath": "docs/plans/2026-03-08-mid-stream-garbage-detection.md",
+  "tasks": [
+    {"id": "1", "subject": "Task 1: Add config options", "status": "completed"},
+    {"id": "2", "subject": "Task 2: Add PARTIAL_VALIDATION_PROMPT", "status": "completed"},
+    {"id": "3", "subject": "Task 3: Add count_words_in_text helper", "status": "completed"},
+    {"id": "4", "subject": "Task 4: Add validate_response_partial function", "status": "completed"},
+    {"id": "5", "subject": "Task 5: Add StreamingValidator class", "status": "completed"},
+    {"id": "6", "subject": "Task 6: Add extract_text_from_sse_chunks helper", "status": "completed"},
+    {"id": "7", "subject": "Task 7: Update imports in sampling_proxy.py", "status": "completed"},
+    {"id": "8", "subject": "Task 8: Integrate mid-stream validation", "status": "completed"},
+    {"id": "9", "subject": "Task 9: Update README", "status": "completed"},
+    {"id": "10", "subject": "Task 10: Test implementation", "status": "pending"},
+    {"id": "11", "subject": "Refactor: StreamingValidationBuffer for all paths", "status": "completed"}
+  ],
+  "lastUpdated": "2026-03-08T19:30:00Z"
+}

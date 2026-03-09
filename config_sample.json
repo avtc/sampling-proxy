@@ -1,18 +1,18 @@
 {
   "server": {
-    "target_base_url": "http://127.0.0.1:8000/v1",
+    "target_base_url": "http://127.0.0.1:8000",
     "sampling_proxy_base_path": "",
     "sampling_proxy_host": "0.0.0.0",
     "sampling_proxy_port": 8001,
     "connect_timeout_seconds": 5.0,
     "timeout_seconds": 1200.0,
     "supports_openai": true,
-    "supports_anthropic": false
+    "supports_anthropic": true
   },
   "logging": {
     "enable_debug_logs": false,
     "enable_override_logs": false,
-    "enable_validation_logs": false
+    "enable_validation_logs": true
   },
   "default_sampling_params": {
     "top_p": null,
@@ -42,14 +42,18 @@
     }
   },
   "validation": {
+    // sample command to run llama.cpp on windows with Qwen3.5-4B for validation:
+    // llama-server --hf-repo unsloth/Qwen3.5-4B-GGUF --hf-file Qwen3.5-4B-UD-Q6_K_XL.gguf --host 127.0.0.1 --port 1235 -ngl 99 --parallel 2 --jinja -fa on -c 40000 --chat-template-kwargs "{\"enable_thinking\": false}"
     "enabled": false,
-    "validator_url": "http://127.0.0.1:1234",
-    "validator_model": "qwen-3.5-0.8b",
+    "mid_stream_validation_enabled": true,
+    "mid_stream_validation_interval_words": 300,
+    "validator_url": "http://127.0.0.1:1235",
+    "validator_model": "Qwen3.5-4B-UD-Q6_K_XL.gguf",
     "supports_openai": true,
-    "supports_anthropic": false,
+    "supports_anthropic": true,
     "connect_timeout_seconds": 5.0,
     "timeout_seconds": 300.0,
-    "max_retries": 3,
+    "max_retries": 1,
     "retry_base_delay_seconds": 1.0,
     "retry_multiplier": 2.0,
     "confidence_threshold": 0.85

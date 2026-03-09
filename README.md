@@ -319,6 +319,29 @@ The proxy can validate AI responses using a local or remote model with OpenAI-co
 | `validation.max_retries` | Max retry attempts | `3` |
 | `validation.retry_base_delay_seconds` | Initial retry delay | `1.0` |
 | `validation.retry_multiplier` | Backoff multiplier | `2.0` |
+| `validation.mid_stream_validation_enabled` | Enable periodic checks during streaming | `false` |
+| `validation.mid_stream_validation_interval_words` | Check every N words during streaming | `300` |
+
+### Mid-Stream Validation
+
+When enabled, the proxy validates responses periodically during streaming instead of only at the end:
+
+- **Faster garbage detection**: Catches repetition loops at ~300 words instead of waiting for full response
+- **Early retry**: Interrupts garbage responses immediately and retries
+- **Reduced latency**: Don't waste time receiving long garbage responses
+
+**Example config:**
+```json
+{
+  "validation": {
+    "enabled": true,
+    "mid_stream_validation_enabled": true,
+    "mid_stream_validation_interval_words": 300
+  }
+}
+```
+
+**Note:** Mid-stream validation only detects repetition and nonsense. Final validation still checks for truncation and other issues.
 
 ### Logs and Failed Responses
 
