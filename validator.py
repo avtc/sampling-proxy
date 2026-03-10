@@ -16,27 +16,12 @@ import httpx
 class ValidationResult:
     """Result of response validation."""
     is_valid: bool
-    issue_type: Optional[str] = None  # "repetition" | "truncation" | "malformed_tools" | None
+    issue_type: Optional[str] = None  # "repetition" | None
     confidence: float = 1.0
     error: Optional[str] = None  # If validator itself failed
 
 
-VALIDATION_PROMPT = """Check if this AI response has problems.
-
-PROBLEMS:
-- repetition: same phrase repeated 3+ times in a row
-- truncation: text cuts off mid-sentence (incomplete)
-
-If no problems, set is_valid=true and issue_type=null.
-
-Output ONLY JSON (no markdown):
-{{"is_valid":true/false,"issue_type":"repetition"|null,"confidence":0.0-1.0}}
-
-Response:
-{content}"""
-
-
-PARTIAL_VALIDATION_PROMPT = """Is this text stuck in an infinite loop?
+VALIDATION_PROMPT = """Is this text stuck in an infinite loop?
 
 A LOOP is when the SAME paragraph or sentence repeats word-for-word multiple times in a row.
 
@@ -203,7 +188,7 @@ async def call_validator_model(content: str, config: dict) -> dict:
     connect_timeout = config.get("connect_timeout_seconds", 5.0)
     read_timeout = config.get("timeout_seconds", 300.0)
 
-    prompt = PARTIAL_VALIDATION_PROMPT.format(content=content)
+    prompt = VALIDATION_PROMPT.format(content=content)
 
     # Determine which format to use
     if supports_anthropic:
@@ -416,16 +401,10 @@ async def validate_response(response: dict, config: dict) -> ValidationResult:
 
 async def validate_response_partial(content: str, config: dict) -> ValidationResult:
     """
-    Validate partial response content for mid-stream garbage detection.
-
-    Uses PARTIAL_VALIDATION_PROMPT which focuses only on:
-    - Repetition loops
-    - Nonsense/gibberish
-
-    Does NOT check for truncation (expected in partial responses).
+    Validate response content for garbage detection (repetition loops).
 
     Args:
-        content: Partial text content to validate
+        content: Text content to validate
         config: Validation config
 
     Returns:
@@ -443,7 +422,7 @@ async def validate_response_partial(content: str, config: dict) -> ValidationRes
             return ValidationResult(is_valid=True)
 
         # Build prompt with partial content
-        prompt = PARTIAL_VALIDATION_PROMPT.format(content=content)
+        prompt = VALIDATION_PROMPT.format(content=content)
 
         # Get validator config
         validator_url = config.get("validator_url", "http://127.0.0.1:1234")
@@ -554,10 +533,7 @@ def save_mid_stream_failure(text_content: str, word_count: int, issue_type: str,
 def create_error_message(issue_type: Optional[str], saved_path: str) -> dict:
     """Create synthetic assistant message for validation failure."""
     issue_display = {
-        "repetition": "Repetition loop",
-        "nonsense": "Nonsense/gibberish output",
-        "truncation": "Truncated response",
-        "malformed_tools": "Malformed tool calls"
+        "repetition": "Repetition loop"
     }.get(issue_type, "Unknown issue")
 
     error_text = f"""**Garbage Output Detected**
