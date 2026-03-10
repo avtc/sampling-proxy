@@ -8,10 +8,27 @@ from contextlib import asynccontextmanager
 import uvicorn
 import asyncio # Import asyncio for potential sleep
 import argparse # Import argparse for command-line arguments
+import threading
+
+# Global request counter for log correlation
+_request_counter = 0
+_request_counter_lock = threading.Lock()
+
+def get_request_id():
+    """Get next request ID for log correlation."""
+    global _request_counter
+    with _request_counter_lock:
+        _request_counter += 1
+        return _request_counter
+
+def log_info(request_id: int, message: str):
+    """Print info log with request ID prefix."""
+    print(f"[INFO][R:{request_id}] {message}")
 
 # Import validator module for garbage detection
 from validator import (
     validate_response,
+    validate_response_partial,
     save_failed_response,
     save_mid_stream_failure,
     create_error_message,
@@ -24,6 +41,7 @@ from validator import (
     build_anthropic_error_stream,
     build_openai_error_stream
 )
+
 
 def load_config(config_path="config.json"):
     """
@@ -589,6 +607,9 @@ async def proxy_target_requests(path: str, request: Request):
     # Access ENABLE_DEBUG_LOGS from the global scope
     global ENABLE_DEBUG_LOGS
 
+    # Get request ID at the START for proper log correlation
+    request_id = get_request_id()
+
     if ENABLE_DEBUG_LOGS:
         print(f"\n--- Incoming Request: {request.method} {path} ---")
     # Normalize path by removing leading/trailing slashes for consistent matching
@@ -1134,10 +1155,15 @@ async def proxy_target_requests(path: str, request: Request):
         if is_generation_request and request.method == "POST":
             # Check if this is actually a streaming request
             is_streaming_request = incoming_json_body.get("stream", False)
-            
+
+            # Log request start with attempt info
+            max_retries = VALIDATION_CONFIG.get("max_retries", 3)
+            max_attempts = 1 + max_retries
+            log_info(request_id, f"Request started 1/{max_attempts}")
+
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Sending {'streaming' if is_streaming_request else 'non-streaming'} request.")
-            
+
             if is_streaming_request:
                 # For streaming requests, use streaming
                 target_request_obj = client.build_request(
@@ -1168,7 +1194,9 @@ async def proxy_target_requests(path: str, request: Request):
 
                 # Remove headers that interfere with streaming
                 # Use case-insensitive removal to catch all variants
-                headers_to_remove = ["content-length", "transfer-encoding", "connection"]
+                # Note: content-encoding must be removed because httpx automatically decompresses
+                # responses when using aiter_bytes(), so we must not pass this header to clients
+                headers_to_remove = ["content-length", "transfer-encoding", "connection", "content-encoding"]
                 for header in headers_to_remove:
                     response_headers.pop(header, None)
                     response_headers.pop(header.upper(), None)
@@ -1204,7 +1232,6 @@ async def proxy_target_requests(path: str, request: Request):
 
                         while attempt < max_attempts:
                             attempt += 1
-                            print(f"INFO: Request started {attempt}/{max_attempts}")
 
                             # Use unified buffer with mid-stream validation
                             buffer = StreamingValidationBuffer(VALIDATION_CONFIG, ENABLE_DEBUG_LOGS)
@@ -1270,7 +1297,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 saved_path = save_mid_stream_failure(
                                     text_content, word_count, issue_type, attempt, buffer.get_chunks()
                                 )
-                                print(f"INFO: Validation failed (confidence: {confidence:.2f}, issue: {issue_type}) see: {saved_path}")
+                                log_info(request_id, f"Validation failed (confidence: {confidence:.2f}, issue: {issue_type}) see: {saved_path}")
 
                                 if attempt >= max_attempts:
                                     # Return error message as stream
@@ -1298,36 +1325,38 @@ async def proxy_target_requests(path: str, request: Request):
                                     current_response = retry_response
                                     continue
                                 else:
-                                    print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                    log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
                                     await retry_response.aclose()
                                     break
 
-                            # Final validation
+                            # Validation - use same text extraction as mid-stream for consistency
                             chunks = buffer.get_chunks()
                             try:
-                                response_text = buffer.get_content().decode('utf-8')
-                                response_dict = parse_sse_to_response(response_text)
+                                # Extract text using same method as mid-stream validation
+                                text_content = extract_text_from_sse_chunks(chunks)
+                                word_count = count_words_in_text(text_content)
 
-                                if response_dict:
-                                    # Final validation
-                                    validation_result = await buffer.validate_final(response_dict, VALIDATION_CONFIG)
+                                if text_content.strip():
+                                    # Validation using same validator as mid-stream
+                                    log_info(request_id, f"Validation started ({word_count} words)")
+                                    validation_result = await validate_response_partial(text_content, VALIDATION_CONFIG)
 
                                     if validation_result.error:
-                                        print(f"WARNING: Validator error: {validation_result.error}")
+                                        log_info(request_id, f"WARNING: Validator error: {validation_result.error}")
                                         for chunk in chunks:
                                             yield chunk
                                         return
 
                                     if validation_result.is_valid:
-                                        if ENABLE_DEBUG_LOGS:
-                                            print(f"DEBUG: Streaming response validated (attempt {attempt})")
+                                        log_info(request_id, f"Validation passed (is_valid={validation_result.is_valid}, issue_type={validation_result.issue_type}, confidence={validation_result.confidence:.2f})")
                                         for chunk in chunks:
                                             yield chunk
                                         return
 
-                                    # Save failed response (every attempt)
-                                    saved_path = save_failed_response(response_dict, validation_result, attempt)
-                                    print(f"INFO: Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
+                                    log_info(request_id, f"Validation failed (is_valid={validation_result.is_valid}, issue_type={validation_result.issue_type}, confidence={validation_result.confidence:.2f})")
+                                    # Save failed response using same format as mid-stream
+                                    saved_path = save_mid_stream_failure(text_content, word_count, validation_result.issue_type, attempt, chunks)
+                                    log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                                     if attempt >= max_attempts:
                                         error_response = create_error_message(validation_result.issue_type, saved_path)
@@ -1353,18 +1382,20 @@ async def proxy_target_requests(path: str, request: Request):
                                         current_response = retry_response
                                         continue
                                     else:
-                                        print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
                                         await retry_response.aclose()
                                         for chunk in chunks:
                                             yield chunk
                                         return
                                 else:
+                                    # Empty content (tool-only response) - pass through without validation
+                                    log_info(request_id, "Validation skipped (no text content)")
                                     for chunk in chunks:
                                         yield chunk
                                     return
 
                             except Exception as e:
-                                print(f"ERROR during streaming validation: {e}")
+                                log_info(request_id, f"ERROR during streaming validation: {e}")
                                 for chunk in chunks:
                                     yield chunk
                                 return
@@ -1394,7 +1425,6 @@ async def proxy_target_requests(path: str, request: Request):
 
                         while attempt < max_attempts:
                             attempt += 1
-                            print(f"INFO: Request started {attempt}/{max_attempts}")
 
                             # Use unified buffer with mid-stream validation
                             buffer = StreamingValidationBuffer(VALIDATION_CONFIG, ENABLE_DEBUG_LOGS)
@@ -1459,7 +1489,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 saved_path = save_mid_stream_failure(
                                     text_content, word_count, issue_type, attempt, buffer.get_chunks()
                                 )
-                                print(f"INFO: Validation failed (confidence: {buffer.get_detection_confidence():.2f}, issue: {issue_type}) see: {saved_path}")
+                                log_info(request_id, f"Validation failed (confidence: {buffer.get_detection_confidence():.2f}, issue: {issue_type}) see: {saved_path}")
 
                                 if attempt >= max_attempts:
                                     error_response = create_error_message(issue_type, saved_path)
@@ -1486,7 +1516,7 @@ async def proxy_target_requests(path: str, request: Request):
                                     current_response = retry_response
                                     continue
                                 else:
-                                    print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                    log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
                                     await retry_response.aclose()
                                     response_text = buffer.get_content().decode('utf-8')
                                     anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
@@ -1494,34 +1524,38 @@ async def proxy_target_requests(path: str, request: Request):
                                         yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
                                     return
 
-                            # Final validation
+                            # Validation - use same text extraction as mid-stream for consistency
                             chunks = buffer.get_chunks()
                             try:
                                 response_text = buffer.get_content().decode('utf-8')
-                                openai_response = parse_openai_sse_to_response(response_text)
 
-                                if openai_response:
-                                    print(f"VALIDATION: [OpenAI convert streaming] validating response id={openai_response.get('id', 'unknown')}")
-                                    validation_result = await buffer.validate_final(openai_response, VALIDATION_CONFIG)
+                                # Extract text using same method as mid-stream validation
+                                text_content = extract_text_from_sse_chunks(chunks)
+                                word_count = count_words_in_text(text_content)
+
+                                if text_content.strip():
+                                    # Validation using same validator as mid-stream
+                                    log_info(request_id, f"Validation started ({word_count} words)")
+                                    validation_result = await validate_response_partial(text_content, VALIDATION_CONFIG)
 
                                     if validation_result.error:
-                                        print(f"WARNING: Validator error: {validation_result.error}")
+                                        log_info(request_id, f"WARNING: Validator error: {validation_result.error}")
                                         anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
                                         for ac in anthropic_chunks:
                                             yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
                                         return
 
                                     if validation_result.is_valid:
-                                        if ENABLE_DEBUG_LOGS:
-                                            print(f"DEBUG: Streaming response validated (attempt {attempt})")
+                                        log_info(request_id, f"Validation passed (is_valid={validation_result.is_valid}, issue_type={validation_result.issue_type}, confidence={validation_result.confidence:.2f})")
                                         anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
                                         for ac in anthropic_chunks:
                                             yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
                                         return
 
-                                    # Save failed response (every attempt)
-                                    saved_path = save_failed_response(openai_response, validation_result, attempt)
-                                    print(f"INFO: Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
+                                    log_info(request_id, f"Validation failed (is_valid={validation_result.is_valid}, issue_type={validation_result.issue_type}, confidence={validation_result.confidence:.2f})")
+                                    # Save failed response using same format as mid-stream
+                                    saved_path = save_mid_stream_failure(text_content, word_count, validation_result.issue_type, attempt, chunks)
+                                    log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                                     if attempt >= max_attempts:
                                         error_response = create_error_message(validation_result.issue_type, saved_path)
@@ -1547,19 +1581,22 @@ async def proxy_target_requests(path: str, request: Request):
                                         current_response = retry_response
                                         continue
                                     else:
-                                        print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
                                         await retry_response.aclose()
                                         anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
                                         for ac in anthropic_chunks:
                                             yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
                                         return
                                 else:
-                                    for chunk in chunks:
-                                        yield chunk
+                                    # Empty content (tool-only response) - convert and pass through without validation
+                                    log_info(request_id, "Validation skipped (no text content)")
+                                    anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
+                                    for ac in anthropic_chunks:
+                                        yield f"event: {ac.get('type', 'message')}\ndata: {json.dumps(ac)}\n\n".encode()
                                     return
 
                             except Exception as e:
-                                print(f"ERROR during OpenAI streaming validation: {e}")
+                                log_info(request_id, f"ERROR during OpenAI streaming validation: {e}")
                                 for chunk in chunks:
                                     yield chunk
                                 return
@@ -1585,59 +1622,65 @@ async def proxy_target_requests(path: str, request: Request):
 
                         while attempt < max_attempts:
                             attempt += 1
-                            print(f"INFO: Request started {attempt}/{max_attempts}")
 
                             # Use unified buffer with mid-stream validation
                             buffer = StreamingValidationBuffer(VALIDATION_CONFIG, ENABLE_DEBUG_LOGS)
+                            progress = BufferingProgress()
+                            progress.start(attempt, max_attempts, buffer)
 
-                            # Stream with immediate garbage detection interrupt
-                            chunk_iterator = current_response.aiter_bytes()
-                            garbage_event = buffer.get_garbage_event()
-                            stream_done = False
-                            garbage_interrupted = False
+                            try:
+                                # Stream with immediate garbage detection interrupt
+                                chunk_iterator = current_response.aiter_bytes()
+                                garbage_event = buffer.get_garbage_event()
+                                stream_done = False
+                                garbage_interrupted = False
 
-                            while not stream_done:
-                                # Create task for reading next chunk
-                                read_task = asyncio.create_task(chunk_iterator.__anext__())
-                                # Create task for waiting on garbage event
-                                garbage_wait_task = asyncio.create_task(garbage_event.wait())
+                                while not stream_done:
+                                    # Create task for reading next chunk
+                                    read_task = asyncio.create_task(chunk_iterator.__anext__())
+                                    # Create task for waiting on garbage event
+                                    garbage_wait_task = asyncio.create_task(garbage_event.wait())
 
-                                done, pending = await asyncio.wait(
-                                    [read_task, garbage_wait_task],
-                                    return_when=asyncio.FIRST_COMPLETED
-                                )
+                                    done, pending = await asyncio.wait(
+                                        [read_task, garbage_wait_task],
+                                        return_when=asyncio.FIRST_COMPLETED
+                                    )
 
-                                # Cancel pending tasks
-                                for task in pending:
-                                    task.cancel()
-                                    try:
-                                        await task
-                                    except asyncio.CancelledError:
-                                        pass
+                                    # Cancel pending tasks
+                                    for task in pending:
+                                        task.cancel()
+                                        try:
+                                            await task
+                                        except asyncio.CancelledError:
+                                            pass
 
-                                if garbage_wait_task in done:
-                                    # Garbage detected - close connection immediately to stop upstream
-                                    garbage_interrupted = True
+                                    if garbage_wait_task in done:
+                                        # Garbage detected - close connection immediately to stop upstream
+                                        garbage_interrupted = True
+                                        await current_response.aclose()
+                                        break
+
+                                    if read_task in done:
+                                        try:
+                                            chunk = read_task.result()
+                                            if not await buffer.add_chunk(chunk):
+                                                # Garbage detected in add_chunk - close immediately
+                                                garbage_interrupted = True
+                                                await current_response.aclose()
+                                                break
+                                            # Update progress after chunk is processed
+                                            progress.update()
+                                        except StopAsyncIteration:
+                                            stream_done = True  # Stream ended normally
+                                        except Exception:
+                                            break  # Other error
+
+                                # Only wait for validation if not already interrupted
+                                if not garbage_interrupted:
+                                    await buffer.wait_for_pending_validation()
                                     await current_response.aclose()
-                                    break
-
-                                if read_task in done:
-                                    try:
-                                        chunk = read_task.result()
-                                        if not await buffer.add_chunk(chunk):
-                                            # Garbage detected in add_chunk - close immediately
-                                            garbage_interrupted = True
-                                            await current_response.aclose()
-                                            break
-                                    except StopAsyncIteration:
-                                        stream_done = True  # Stream ended normally
-                                    except Exception:
-                                        break  # Other error
-
-                            # Only wait for validation if not already interrupted
-                            if not garbage_interrupted:
-                                await buffer.wait_for_pending_validation()
-                                await current_response.aclose()
+                            finally:
+                                progress.finalize()
 
                             # Handle mid-stream garbage detection
                             if buffer.is_garbage_detected():
@@ -1650,7 +1693,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 saved_path = save_mid_stream_failure(
                                     text_content, word_count, issue_type, attempt, buffer.get_chunks()
                                 )
-                                print(f"INFO: Validation failed (confidence: {buffer.get_detection_confidence():.2f}, issue: {issue_type}) see: {saved_path}")
+                                log_info(request_id, f"Validation failed (confidence: {buffer.get_detection_confidence():.2f}, issue: {issue_type}) see: {saved_path}")
 
                                 if attempt >= max_attempts:
                                     error_response = create_error_message(issue_type, saved_path)
@@ -1677,38 +1720,40 @@ async def proxy_target_requests(path: str, request: Request):
                                     current_response = retry_response
                                     continue
                                 else:
-                                    print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                    log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
                                     await retry_response.aclose()
                                     for chunk in buffer.get_chunks():
                                         yield chunk
                                     return
 
-                            # Final validation
+                            # Validation - use same text extraction as mid-stream for consistency
                             chunks = buffer.get_chunks()
                             try:
-                                response_text = buffer.get_content().decode('utf-8')
-                                openai_response = parse_openai_sse_to_response(response_text)
+                                # Extract text using same method as mid-stream validation
+                                text_content = extract_text_from_sse_chunks(chunks)
+                                word_count = count_words_in_text(text_content)
 
-                                if openai_response:
-                                    # Final validation
-                                    validation_result = await buffer.validate_final(openai_response, VALIDATION_CONFIG)
+                                if text_content.strip():
+                                    # Validation using same validator as mid-stream
+                                    log_info(request_id, f"Validation started ({word_count} words)")
+                                    validation_result = await validate_response_partial(text_content, VALIDATION_CONFIG)
 
                                     if validation_result.error:
-                                        print(f"WARNING: Validator error: {validation_result.error}")
+                                        log_info(request_id, f"WARNING: Validator error: {validation_result.error}")
                                         for chunk in chunks:
                                             yield chunk
                                         return
 
                                     if validation_result.is_valid:
+                                        log_info(request_id, f"Validation passed (is_valid={validation_result.is_valid}, issue_type={validation_result.issue_type}, confidence={validation_result.confidence:.2f})")
                                         for chunk in chunks:
                                             yield chunk
                                         return
 
-                                    # Validation failed - save and retry
-
-                                    # Save failed response (every attempt)
-                                    saved_path = save_failed_response(openai_response, validation_result, attempt)
-                                    print(f"INFO: Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
+                                    log_info(request_id, f"Validation failed (is_valid={validation_result.is_valid}, issue_type={validation_result.issue_type}, confidence={validation_result.confidence:.2f})")
+                                    # Save failed response using same format as mid-stream
+                                    saved_path = save_mid_stream_failure(text_content, word_count, validation_result.issue_type, attempt, chunks)
+                                    log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                                     if attempt >= max_attempts:
                                         error_response = create_error_message(validation_result.issue_type, saved_path)
@@ -1734,18 +1779,20 @@ async def proxy_target_requests(path: str, request: Request):
                                         current_response = retry_response
                                         continue
                                     else:
-                                        print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
                                         await retry_response.aclose()
                                         for chunk in chunks:
                                             yield chunk
                                         return
                                 else:
+                                    # Empty content (tool-only response) - pass through without validation
+                                    log_info(request_id, "Validation skipped (no text content)")
                                     for chunk in chunks:
                                         yield chunk
                                     return
 
                             except Exception as e:
-                                print(f"ERROR during OpenAI passthrough streaming validation: {e}")
+                                log_info(request_id, f"ERROR during OpenAI passthrough streaming validation: {e}")
                                 for chunk in chunks:
                                     yield chunk
                                 return
@@ -2008,7 +2055,7 @@ async def proxy_target_requests(path: str, request: Request):
 
                         if validation_result.error:
                             # Validator failed, log and pass through
-                            print(f"WARNING: Validator error: {validation_result.error}")
+                            log_info(request_id, f"WARNING: Validator error: {validation_result.error}")
                             break
 
                         if validation_result.is_valid:
@@ -2019,7 +2066,7 @@ async def proxy_target_requests(path: str, request: Request):
 
                         # Invalid response - save and retry
                         saved_path = save_failed_response(response_dict, validation_result, attempt)
-                        print(f"INFO: Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
+                        log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                         if attempt >= max_attempts:
                             # Max attempts reached, return error message
@@ -2045,7 +2092,7 @@ async def proxy_target_requests(path: str, request: Request):
                             await retry_response.aclose()
                         else:
                             # Retry request failed, use last response
-                            print(f"WARNING: Retry request failed with status {retry_response.status_code}")
+                            log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
                             await retry_response.aclose()
                             break
 
@@ -2053,9 +2100,12 @@ async def proxy_target_requests(path: str, request: Request):
                 await target_response.aclose()
                 
                 # Create clean headers for the response, removing Content-Length to prevent mismatches
+                # Also remove Content-Encoding since httpx automatically decompresses responses
                 clean_headers = dict(target_response.headers)
                 clean_headers.pop("content-length", None)
                 clean_headers.pop("Content-Length", None)
+                clean_headers.pop("content-encoding", None)
+                clean_headers.pop("Content-Encoding", None)
                 
                 return Response(
                     content=response_content,
@@ -2084,10 +2134,18 @@ async def proxy_target_requests(path: str, request: Request):
             
             # Ensure the httpx response is closed after its content is read
             await target_response.aclose()
+
+            # Clean headers - remove Content-Encoding since httpx auto-decompresses
+            clean_headers = dict(target_response.headers)
+            clean_headers.pop("content-encoding", None)
+            clean_headers.pop("Content-Encoding", None)
+            clean_headers.pop("content-length", None)
+            clean_headers.pop("Content-Length", None)
+
             return Response(
                 content=target_response.content,
                 status_code=target_response.status_code,
-                headers=target_response.headers,
+                headers=clean_headers,
                 media_type=target_response.headers.get("content-type"),
             )
 
