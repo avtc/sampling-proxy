@@ -1168,9 +1168,11 @@ async def proxy_target_requests(path: str, request: Request):
         semaphore = get_model_semaphore(model_name)
         if semaphore is not None:
             limit = PARALLEL_LIMITS.get(model_name)
-            # Note: semaphore._value is the current available slots (before acquire)
-            # After acquire, used = limit - semaphore._value
-            log_info(request_id, f"Waiting for parallel slot (model: {model_name}, limit: {limit})")
+            # Check if slot is available - if not, log queue status before waiting
+            if semaphore._value == 0:
+                # Count how many are waiting (excluding current request)
+                waiting = len(semaphore._waiters) if semaphore._waiters else 0
+                log_info(request_id, f"Queueing for {model_name}, {waiting} requests waiting (limit: {limit})")
             await semaphore.acquire()
             used = limit - semaphore._value
             log_info(request_id, f"Slot acquired {model_name}, used: {used}/{limit}")
