@@ -42,8 +42,6 @@
     }
   },
   "validation": {
-    // sample command to run llama.cpp on windows with Qwen3.5-4B for validation:
-    // llama-server --hf-repo unsloth/Qwen3.5-4B-GGUF --hf-file Qwen3.5-4B-UD-Q6_K_XL.gguf --host 127.0.0.1 --port 1235 -ngl 99 --parallel 2 --jinja -fa on -c 40000 --chat-template-kwargs "{\"enable_thinking\": false}"  --temp 1 --min-p 0 --top-p 0.95 --top-k 20 --repeat-penalty 1 --presence-penalty 1.5 --cache-ram 0
     "enabled": false,
     "mid_stream_validation_enabled": true,
     "mid_stream_validation_interval_words": 300,
@@ -53,7 +51,7 @@
     "supports_anthropic": true,
     "connect_timeout_seconds": 5.0,
     "timeout_seconds": 300.0,
-    "max_retries": 1,
+    "max_retries": 2,
     "retry_base_delay_seconds": 1.0,
     "retry_multiplier": 2.0,
     "confidence_threshold": 0.85
