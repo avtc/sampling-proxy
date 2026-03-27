@@ -35,5 +35,12 @@
     "retry_base_delay_seconds": 1.0,
     "retry_multiplier": 2.0,
     "confidence_threshold": 0.85
+  },
+  "parallel_limits": {
+    "GLM-4.6": 3,
+    "GLM-4.7": 2,
+    "GLM-5": 2,
+    "GLM-5.1": 2,
+    "GLM-5-Turbo": 1
   }
 }

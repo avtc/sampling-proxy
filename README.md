@@ -6,6 +6,7 @@ A middleware server for OpenAI-compatible backends with passthrough (OpenAI/Anth
 
 - **Passthrough Modes**: OpenAI, Anthropic, and Anthropic-to-OpenAI conversion
 - **Parameter Override**: Apply custom sampling parameters per model
+- **Parallel Request Limits**: Limit concurrent requests per model with automatic queueing
 - **Streaming Support**: Both streaming and non-streaming responses
 - **Garbage Detection**: Validate responses and auto-retry when garbage output is detected
 - **Mid-Stream Validation**: Detect garbage during generation (not just at the end)
@@ -100,6 +101,27 @@ When enabled, validates responses periodically during streaming:
 ### Logs
 
 Failed validation responses saved to `~/.sampling-proxy/logs/`
+
+## Parallel Request Limits
+
+Limit concurrent requests per model to prevent backend overload:
+
+```json
+{
+  "parallel_limits": {
+    "GLM-5": 2,
+    "GLM-4.7": 3
+  }
+}
+```
+
+When limit is reached, additional requests queue automatically. Logs show queue status:
+
+```
+[INFO] Queueing for GLM-5, 2 requests waiting (limit: 2)
+[INFO] Slot acquired GLM-5, used: 2/2
+[INFO] Slot released GLM-5, used: 1/2
+```
 
 ## API Endpoints
 
