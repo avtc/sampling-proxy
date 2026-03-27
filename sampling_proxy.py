@@ -1167,9 +1167,13 @@ async def proxy_target_requests(path: str, request: Request):
     if is_generation_request and request.method == "POST" and model_name:
         semaphore = get_model_semaphore(model_name)
         if semaphore is not None:
-            log_info(request_id, f"Waiting for parallel slot (model: {model_name}, limit: {PARALLEL_LIMITS.get(model_name)})")
+            limit = PARALLEL_LIMITS.get(model_name)
+            # Note: semaphore._value is the current available slots (before acquire)
+            # After acquire, used = limit - semaphore._value
+            log_info(request_id, f"Waiting for parallel slot (model: {model_name}, limit: {limit})")
             await semaphore.acquire()
-            log_info(request_id, f"Parallel slot acquired (model: {model_name})")
+            used = limit - semaphore._value
+            log_info(request_id, f"Slot acquired {model_name}, used: {used}/{limit}")
 
     # --- Forward Request and Handle Response ---
     try:
@@ -1969,9 +1973,9 @@ async def proxy_target_requests(path: str, request: Request):
                 # Log 404 errors specifically for debugging
                 if target_response.status_code == 404:
                     if is_anthropic_request:
-                        print(f"WARNING: Anthropic request to {target_path} returned 404. OpenAI Compatible backend may not support OpenAI chat completions endpoint.")
+                        print(f"WARNING: Anthropic request to {target_path} returned 404. Upstream server may not support OpenAI chat completions endpoint.")
                     else:
-                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on OpenAI Compatible backend.")
+                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on upstream server.")
 
                 if is_anthropic_request and not should_passthrough_anthropic and target_response.status_code == 200:
                     try:
@@ -2151,7 +2155,7 @@ async def proxy_target_requests(path: str, request: Request):
             
             # Log 404 errors specifically for debugging
             if target_response.status_code == 404:
-                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on OpenAI Compatible backend.")
+                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on upstream server.")
             
             # Ensure the httpx response is closed after its content is read
             await target_response.aclose()
@@ -2171,12 +2175,12 @@ async def proxy_target_requests(path: str, request: Request):
             )
 
     except httpx.ConnectError as e:
-        print(f"ERROR: [{request.method} {original_path}] Connection error to OpenAI Compatible backend: {e}")
-        return Response(f"Could not connect to OpenAI Compatible backend at {TARGET_BASE_URL}: {e}",
+        print(f"ERROR: [{request.method} {original_path}] Connection error to upstream server: {e}")
+        return Response(f"Could not connect to upstream server at {TARGET_BASE_URL}: {e}",
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     except httpx.RequestError as e:
-        print(f"ERROR: [{request.method} {original_path}] Request error to OpenAI Compatible backend: {e}")
-        return Response(f"An error occurred while requesting OpenAI Compatible backend: {e}",
+        print(f"ERROR: [{request.method} {original_path}] Request error to upstream server: {e}")
+        return Response(f"An error occurred while requesting upstream server: {e}",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
         print(f"ERROR: [{request.method} {original_path}] An unexpected error occurred: {e}")
@@ -2187,7 +2191,10 @@ async def proxy_target_requests(path: str, request: Request):
         # Release the semaphore if it was acquired
         if semaphore is not None:
             semaphore.release()
-            log_info(request_id, f"Parallel slot released (model: {model_name})")
+            limit = PARALLEL_LIMITS.get(model_name)
+            # After release, _value reflects the new available count
+            used = limit - semaphore._value
+            log_info(request_id, f"Slot released {model_name}, used: {used}/{limit}")
 
 # --- Main execution block for direct script execution ---
 if __name__ == "__main__":
@@ -2322,7 +2329,7 @@ if __name__ == "__main__":
         print(f"Override model_name from command line: {OVERRIDE_MODEL_NAME}")
 
     print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
-    print(f"Proxying requests to OpenAI Compatible backend at {TARGET_BASE_URL}")
+    print(f"Proxying requests to upstream server at {TARGET_BASE_URL}")
     print(f"Server capabilities: OpenAI={SERVER_SUPPORTS_OPENAI}, Anthropic={SERVER_SUPPORTS_ANTHROPIC}")
     print(f"Debug logs are {'ENABLED' if ENABLE_DEBUG_LOGS else 'DISABLED'}.")
     print(f"Override logs are {'ENABLED' if ENABLE_OVERRIDE_LOGS else 'DISABLED'}.")
