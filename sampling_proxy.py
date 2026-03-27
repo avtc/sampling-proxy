@@ -225,7 +225,7 @@ ANTHROPIC_ENDPOINTS = [
 # Global variable to store the first available model name from /models to be used for anthropic requests
 FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
 
-# Initialize an httpx AsyncClient for making requests to the OpenAI Compatible backend.
+# Initialize an httpx AsyncClient for making requests to the upstream server.
 # This client is designed for efficient connection pooling.
 # A higher timeout is set to accommodate potentially long LLM generation times.
 # Note: This will be re-initialized after config loading in the main block
@@ -298,7 +298,7 @@ async def lifespan(app: FastAPI):
 # --- FastAPI Application Setup ---
 app = FastAPI(
     title="Sampling Proxy",
-    description="A middleware server to override sampling parameters for generation requests, supports OpenAI Compatible target server and OpenAI Compatible and Anthropic requests.",
+    description="A middleware server to override sampling parameters for generation requests, supports OpenAI-compatible and Anthropic request formats.",
     version="1.0.0",
     lifespan=lifespan # Register the lifespan context manager
 )
@@ -609,10 +609,10 @@ def convert_openai_sse_to_anthropic_chunks(sse_text: str) -> list:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_target_requests(path: str, request: Request):
     """
-    Catch-all route to proxy all incoming requests to the OpenAI Compatible backend.
+    Catch-all route to proxy all incoming requests to the upstream server.
     For POST requests to configured generation endpoints, it applies
     the sampling parameter override logic.
-    Supports streaming responses from the OpenAI Compatible backend back to the client.
+    Supports streaming responses from the upstream server back to the client.
     """
     # Access ENABLE_DEBUG_LOGS from the global scope
     global ENABLE_DEBUG_LOGS
@@ -738,7 +738,7 @@ async def proxy_target_requests(path: str, request: Request):
             media_type="application/json"
         )
 
-    # Prepare headers for the outgoing request to OpenAI Compatible backend.
+    # Prepare headers for the outgoing request to upstream server.
     # We copy the incoming headers and remove 'host' and 'content-length'
     # as httpx will manage these for the new request.
     headers = dict(request.headers)
@@ -772,7 +772,7 @@ async def proxy_target_requests(path: str, request: Request):
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Anthropic passthrough mode - keeping path: {target_path}")
         else:
-            # Convert /v1/messages to /chat/completions for OpenAI Compatible backend
+            # Convert /v1/messages to /chat/completions for OpenAI-compatible upstream server
             # First apply the path transformation, then change to chat completions
             transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
             target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
@@ -815,7 +815,7 @@ async def proxy_target_requests(path: str, request: Request):
     # Ensure the query string is encoded to bytes as required by httpx.URL
     target_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Target OpenAI Compatible URL: {target_url}")
+        print(f"DEBUG: Target upstream URL: {target_url}")
 
     # --- Sampling Parameter Override Logic ---
     if is_generation_request and request.method == "POST":
@@ -1215,7 +1215,7 @@ async def proxy_target_requests(path: str, request: Request):
                 # Prepare response headers for streaming
                 response_headers = dict(target_response.headers)
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: OpenAI Compatible Response Headers (raw): {response_headers}")
+                    print(f"DEBUG: Upstream Response Headers (raw): {response_headers}")
 
                 # Remove headers that interfere with streaming
                 # Use case-insensitive removal to catch all variants
@@ -1951,7 +1951,7 @@ async def proxy_target_requests(path: str, request: Request):
                     finally:
                         # Ensure the httpx response is closed after iteration
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: OpenAI Compatible response connection closed by generator after {chunk_count} chunks.")
+                            print(f"DEBUG: Upstream response connection closed by generator after {chunk_count} chunks.")
                         await target_response.aclose()
 
                 return StreamingResponse(
@@ -1963,9 +1963,9 @@ async def proxy_target_requests(path: str, request: Request):
             else:
                 # Handle non-streaming response
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: OpenAI Compatible Response Headers (full): {target_response.headers}")
-                    print(f"DEBUG: OpenAI Compatible Response Status: {target_response.status_code}")
-                    print(f"DEBUG: OpenAI Compatible Response Content: {target_response.text}")
+                    print(f"DEBUG: Upstream Response Headers (full): {target_response.headers}")
+                    print(f"DEBUG: Upstream Response Status: {target_response.status_code}")
+                    print(f"DEBUG: Upstream Response Content: {target_response.text}")
                 
                 # Handle Anthropic response conversion for non-streaming requests
                 response_content = target_response.content
@@ -2140,7 +2140,7 @@ async def proxy_target_requests(path: str, request: Request):
                 )
         else:
             if ENABLE_DEBUG_LOGS:
-                print("DEBUG: Sending non-generation request to OpenAI Compatible.")
+                print("DEBUG: Sending non-generation request to upstream server.")
             # For all other requests (e.g., GET /models), fetch the full response
             target_response = await client.request(
                 method=request.method,
@@ -2150,8 +2150,8 @@ async def proxy_target_requests(path: str, request: Request):
                 content=request_content,
             )
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: OpenAI Compatible Response Headers (full): {target_response.headers}")
-                print(f"DEBUG: OpenAI Compatible Response Status: {target_response.status_code}")
+                print(f"DEBUG: Upstream Response Headers (full): {target_response.headers}")
+                print(f"DEBUG: Upstream Response Status: {target_response.status_code}")
             
             # Log 404 errors specifically for debugging
             if target_response.status_code == 404:
@@ -2227,7 +2227,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--target-base-url",
         type=str,
-        help="Base URL for the OpenAI compatible backend (overrides config)",
+        help="Base URL for the upstream server (overrides config)",
     )
     parser.add_argument(
         "--debug-logs",
