@@ -84,7 +84,8 @@ def load_config(config_path="config.json"):
             "retry_multiplier": 2.0,
             "mid_stream_validation_enabled": False,
             "mid_stream_validation_interval_words": 300
-        }
+        },
+        "parallel_limits": {}
     }
     
     if not os.path.exists(config_path):
@@ -202,6 +203,10 @@ SERVER_SUPPORTS_OPENAI = True
 SERVER_SUPPORTS_ANTHROPIC = False
 VALIDATION_CONFIG = {"enabled": False}
 
+# Per-model parallel request limits (model_name -> asyncio.Semaphore)
+PARALLEL_LIMITS = {}
+MODEL_SEMAPHORES = {}
+
 # List of API path suffixes that are considered "generation" endpoints.
 # Note: We check if the path ENDS WITH these suffixes to handle various prefixes
 GENERATION_ENDPOINT_SUFFIXES = [
@@ -225,6 +230,10 @@ FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact
 # A higher timeout is set to accommodate potentially long LLM generation times.
 # Note: This will be re-initialized after config loading in the main block
 client = None
+
+def get_model_semaphore(model_name: str):
+    """Get the semaphore for a model if a parallel limit is configured. Returns None if no limit."""
+    return MODEL_SEMAPHORES.get(model_name)
 
 # --- FastAPI Application Lifespan Setup ---
 @asynccontextmanager
@@ -309,6 +318,7 @@ async def read_root():
         "generation_endpoints_monitored": GENERATION_ENDPOINT_SUFFIXES,
         "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
         "debug_logs_enabled": ENABLE_DEBUG_LOGS,
+        "parallel_limits": PARALLEL_LIMITS,
     }
 
 def parse_sse_to_response(sse_text: str) -> Optional[dict]:
@@ -2256,6 +2266,18 @@ if __name__ == "__main__":
     VALIDATION_CONFIG = CONFIG.get("validation", {"enabled": False})
     VALIDATION_CONFIG["enable_validation_logs"] = ENABLE_VALIDATION_LOGS
     print(f"Validation config loaded: enabled={VALIDATION_CONFIG.get('enabled')}, mid_stream_enabled={VALIDATION_CONFIG.get('mid_stream_validation_enabled')}")
+
+    # Load parallel request limits and initialize semaphores
+    PARALLEL_LIMITS = CONFIG.get("parallel_limits", {})
+    MODEL_SEMAPHORES = {}
+    for model_name, limit in PARALLEL_LIMITS.items():
+        if isinstance(limit, int) and limit > 0:
+            MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(limit)
+            print(f"Parallel limit: model '{model_name}' limited to {limit} concurrent request(s)")
+        else:
+            print(f"WARNING: Invalid parallel limit for model '{model_name}': {limit}. Must be a positive integer. Skipping.")
+    if not PARALLEL_LIMITS:
+        print("No parallel request limits configured.")
 
     # Parse override parameters from command line if provided (takes precedence over config)
     if args.override_sampling_params:
