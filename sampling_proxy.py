@@ -1160,6 +1160,17 @@ async def proxy_target_requests(path: str, request: Request):
             print(f"DEBUG: Not a POST generation request (is_generation_request={is_generation_request}, method={request.method}). Proxying raw body without modification.")
         request_content = await request.body()
 
+    # --- Parallel Limit Semaphore ---
+    # If a parallel limit is configured for this model, acquire a slot before forwarding.
+    # The semaphore is released after the response is fully sent (streaming or not).
+    semaphore = None
+    if is_generation_request and request.method == "POST" and model_name:
+        semaphore = get_model_semaphore(model_name)
+        if semaphore is not None:
+            log_info(request_id, f"Waiting for parallel slot (model: {model_name}, limit: {PARALLEL_LIMITS.get(model_name)})")
+            await semaphore.acquire()
+            log_info(request_id, f"Parallel slot acquired (model: {model_name})")
+
     # --- Forward Request and Handle Response ---
     try:
         if is_generation_request and request.method == "POST":
@@ -2171,6 +2182,12 @@ async def proxy_target_requests(path: str, request: Request):
         print(f"ERROR: [{request.method} {original_path}] An unexpected error occurred: {e}")
         return Response(f"An unexpected error occurred: {e}",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        # --- Parallel Limit Semaphore Release ---
+        # Release the semaphore if it was acquired
+        if semaphore is not None:
+            semaphore.release()
+            log_info(request_id, f"Parallel slot released (model: {model_name})")
 
 # --- Main execution block for direct script execution ---
 if __name__ == "__main__":
