@@ -84,7 +84,8 @@ def load_config(config_path="config.json"):
             "retry_multiplier": 2.0,
             "mid_stream_validation_enabled": False,
             "mid_stream_validation_interval_words": 300
-        }
+        },
+        "parallel_limits": {}
     }
     
     if not os.path.exists(config_path):
@@ -202,6 +203,14 @@ SERVER_SUPPORTS_OPENAI = True
 SERVER_SUPPORTS_ANTHROPIC = False
 VALIDATION_CONFIG = {"enabled": False}
 
+# Per-model parallel request limits (model_name -> asyncio.Semaphore)
+PARALLEL_LIMITS = {}
+MODEL_SEMAPHORES = {}
+
+# Global parallel request limit (across all models)
+GLOBAL_LIMIT = None
+GLOBAL_SEMAPHORE = None
+
 # List of API path suffixes that are considered "generation" endpoints.
 # Note: We check if the path ENDS WITH these suffixes to handle various prefixes
 GENERATION_ENDPOINT_SUFFIXES = [
@@ -220,11 +229,19 @@ ANTHROPIC_ENDPOINTS = [
 # Global variable to store the first available model name from /models to be used for anthropic requests
 FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
 
-# Initialize an httpx AsyncClient for making requests to the OpenAI Compatible backend.
+# Initialize an httpx AsyncClient for making requests to the upstream server.
 # This client is designed for efficient connection pooling.
 # A higher timeout is set to accommodate potentially long LLM generation times.
 # Note: This will be re-initialized after config loading in the main block
 client = None
+
+def get_model_semaphore(model_name: str):
+    """Get the semaphore for a model if a parallel limit is configured. Returns None if no limit."""
+    return MODEL_SEMAPHORES.get(model_name.lower())
+
+def get_global_semaphore():
+    """Get the global semaphore if a global limit is configured. Returns None if no limit."""
+    return GLOBAL_SEMAPHORE
 
 # --- FastAPI Application Lifespan Setup ---
 @asynccontextmanager
@@ -289,7 +306,7 @@ async def lifespan(app: FastAPI):
 # --- FastAPI Application Setup ---
 app = FastAPI(
     title="Sampling Proxy",
-    description="A middleware server to override sampling parameters for generation requests, supports OpenAI Compatible target server and OpenAI Compatible and Anthropic requests.",
+    description="A middleware server to override sampling parameters for generation requests, supports OpenAI-compatible and Anthropic request formats.",
     version="1.0.0",
     lifespan=lifespan # Register the lifespan context manager
 )
@@ -309,6 +326,7 @@ async def read_root():
         "generation_endpoints_monitored": GENERATION_ENDPOINT_SUFFIXES,
         "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
         "debug_logs_enabled": ENABLE_DEBUG_LOGS,
+        "parallel_limits": {**({"global": GLOBAL_LIMIT} if GLOBAL_LIMIT is not None else {}), **PARALLEL_LIMITS},
     }
 
 def parse_sse_to_response(sse_text: str) -> Optional[dict]:
@@ -599,10 +617,10 @@ def convert_openai_sse_to_anthropic_chunks(sse_text: str) -> list:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_target_requests(path: str, request: Request):
     """
-    Catch-all route to proxy all incoming requests to the OpenAI Compatible backend.
+    Catch-all route to proxy all incoming requests to the upstream server.
     For POST requests to configured generation endpoints, it applies
     the sampling parameter override logic.
-    Supports streaming responses from the OpenAI Compatible backend back to the client.
+    Supports streaming responses from the upstream server back to the client.
     """
     # Access ENABLE_DEBUG_LOGS from the global scope
     global ENABLE_DEBUG_LOGS
@@ -728,7 +746,7 @@ async def proxy_target_requests(path: str, request: Request):
             media_type="application/json"
         )
 
-    # Prepare headers for the outgoing request to OpenAI Compatible backend.
+    # Prepare headers for the outgoing request to upstream server.
     # We copy the incoming headers and remove 'host' and 'content-length'
     # as httpx will manage these for the new request.
     headers = dict(request.headers)
@@ -762,7 +780,7 @@ async def proxy_target_requests(path: str, request: Request):
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Anthropic passthrough mode - keeping path: {target_path}")
         else:
-            # Convert /v1/messages to /chat/completions for OpenAI Compatible backend
+            # Convert /v1/messages to /chat/completions for OpenAI-compatible upstream server
             # First apply the path transformation, then change to chat completions
             transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
             target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
@@ -805,7 +823,7 @@ async def proxy_target_requests(path: str, request: Request):
     # Ensure the query string is encoded to bytes as required by httpx.URL
     target_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Target OpenAI Compatible URL: {target_url}")
+        print(f"DEBUG: Target upstream URL: {target_url}")
 
     # --- Sampling Parameter Override Logic ---
     if is_generation_request and request.method == "POST":
@@ -1150,6 +1168,33 @@ async def proxy_target_requests(path: str, request: Request):
             print(f"DEBUG: Not a POST generation request (is_generation_request={is_generation_request}, method={request.method}). Proxying raw body without modification.")
         request_content = await request.body()
 
+    # --- Parallel Limit Semaphores ---
+    # Acquire both global and model-specific semaphores if configured.
+    # Semaphores are released after the response is fully sent (streaming or not).
+    global_semaphore = None
+    model_semaphore = None
+    if is_generation_request and request.method == "POST" and model_name:
+        # Acquire global semaphore first (if configured)
+        global_semaphore = get_global_semaphore()
+        if global_semaphore is not None:
+            if global_semaphore._value == 0:
+                waiting = len(global_semaphore._waiters) if global_semaphore._waiters else 0
+                log_info(request_id, f"Queueing for global limit, {waiting} requests waiting (limit: {GLOBAL_LIMIT})")
+            await global_semaphore.acquire()
+            used = GLOBAL_LIMIT - global_semaphore._value
+            log_info(request_id, f"Global slot acquired, used: {used}/{GLOBAL_LIMIT}")
+        
+        # Then acquire model-specific semaphore (if configured)
+        model_semaphore = get_model_semaphore(model_name)
+        if model_semaphore is not None:
+            limit = PARALLEL_LIMITS.get(model_name.lower())
+            if model_semaphore._value == 0:
+                waiting = len(model_semaphore._waiters) if model_semaphore._waiters else 0
+                log_info(request_id, f"Queueing for {model_name}, {waiting} requests waiting (limit: {limit})")
+            await model_semaphore.acquire()
+            used = limit - model_semaphore._value
+            log_info(request_id, f"Slot acquired {model_name}, used: {used}/{limit}")
+
     # --- Forward Request and Handle Response ---
     try:
         if is_generation_request and request.method == "POST":
@@ -1190,7 +1235,7 @@ async def proxy_target_requests(path: str, request: Request):
                 # Prepare response headers for streaming
                 response_headers = dict(target_response.headers)
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: OpenAI Compatible Response Headers (raw): {response_headers}")
+                    print(f"DEBUG: Upstream Response Headers (raw): {response_headers}")
 
                 # Remove headers that interfere with streaming
                 # Use case-insensitive removal to catch all variants
@@ -1926,7 +1971,7 @@ async def proxy_target_requests(path: str, request: Request):
                     finally:
                         # Ensure the httpx response is closed after iteration
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: OpenAI Compatible response connection closed by generator after {chunk_count} chunks.")
+                            print(f"DEBUG: Upstream response connection closed by generator after {chunk_count} chunks.")
                         await target_response.aclose()
 
                 return StreamingResponse(
@@ -1938,9 +1983,9 @@ async def proxy_target_requests(path: str, request: Request):
             else:
                 # Handle non-streaming response
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: OpenAI Compatible Response Headers (full): {target_response.headers}")
-                    print(f"DEBUG: OpenAI Compatible Response Status: {target_response.status_code}")
-                    print(f"DEBUG: OpenAI Compatible Response Content: {target_response.text}")
+                    print(f"DEBUG: Upstream Response Headers (full): {target_response.headers}")
+                    print(f"DEBUG: Upstream Response Status: {target_response.status_code}")
+                    print(f"DEBUG: Upstream Response Content: {target_response.text}")
                 
                 # Handle Anthropic response conversion for non-streaming requests
                 response_content = target_response.content
@@ -1948,9 +1993,9 @@ async def proxy_target_requests(path: str, request: Request):
                 # Log 404 errors specifically for debugging
                 if target_response.status_code == 404:
                     if is_anthropic_request:
-                        print(f"WARNING: Anthropic request to {target_path} returned 404. OpenAI Compatible backend may not support OpenAI chat completions endpoint.")
+                        print(f"WARNING: Anthropic request to {target_path} returned 404. Upstream server may not support OpenAI chat completions endpoint.")
                     else:
-                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on OpenAI Compatible backend.")
+                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on upstream server.")
 
                 if is_anthropic_request and not should_passthrough_anthropic and target_response.status_code == 200:
                     try:
@@ -2115,7 +2160,7 @@ async def proxy_target_requests(path: str, request: Request):
                 )
         else:
             if ENABLE_DEBUG_LOGS:
-                print("DEBUG: Sending non-generation request to OpenAI Compatible.")
+                print("DEBUG: Sending non-generation request to upstream server.")
             # For all other requests (e.g., GET /models), fetch the full response
             target_response = await client.request(
                 method=request.method,
@@ -2125,12 +2170,12 @@ async def proxy_target_requests(path: str, request: Request):
                 content=request_content,
             )
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: OpenAI Compatible Response Headers (full): {target_response.headers}")
-                print(f"DEBUG: OpenAI Compatible Response Status: {target_response.status_code}")
+                print(f"DEBUG: Upstream Response Headers (full): {target_response.headers}")
+                print(f"DEBUG: Upstream Response Status: {target_response.status_code}")
             
             # Log 404 errors specifically for debugging
             if target_response.status_code == 404:
-                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on OpenAI Compatible backend.")
+                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on upstream server.")
             
             # Ensure the httpx response is closed after its content is read
             await target_response.aclose()
@@ -2150,17 +2195,29 @@ async def proxy_target_requests(path: str, request: Request):
             )
 
     except httpx.ConnectError as e:
-        print(f"ERROR: [{request.method} {original_path}] Connection error to OpenAI Compatible backend: {e}")
-        return Response(f"Could not connect to OpenAI Compatible backend at {TARGET_BASE_URL}: {e}",
+        print(f"ERROR: [{request.method} {original_path}] Connection error to upstream server: {e}")
+        return Response(f"Could not connect to upstream server at {TARGET_BASE_URL}: {e}",
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     except httpx.RequestError as e:
-        print(f"ERROR: [{request.method} {original_path}] Request error to OpenAI Compatible backend: {e}")
-        return Response(f"An error occurred while requesting OpenAI Compatible backend: {e}",
+        print(f"ERROR: [{request.method} {original_path}] Request error to upstream server: {e}")
+        return Response(f"An error occurred while requesting upstream server: {e}",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
         print(f"ERROR: [{request.method} {original_path}] An unexpected error occurred: {e}")
         return Response(f"An unexpected error occurred: {e}",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        # --- Parallel Limit Semaphore Release ---
+        # Release semaphores in reverse order of acquisition (model first, then global)
+        if model_semaphore is not None:
+            model_semaphore.release()
+            limit = PARALLEL_LIMITS.get(model_name.lower())
+            used = limit - model_semaphore._value
+            log_info(request_id, f"Slot released {model_name}, used: {used}/{limit}")
+        if global_semaphore is not None:
+            global_semaphore.release()
+            used = GLOBAL_LIMIT - global_semaphore._value
+            log_info(request_id, f"Global slot released, used: {used}/{GLOBAL_LIMIT}")
 
 # --- Main execution block for direct script execution ---
 if __name__ == "__main__":
@@ -2193,7 +2250,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--target-base-url",
         type=str,
-        help="Base URL for the OpenAI compatible backend (overrides config)",
+        help="Base URL for the upstream server (overrides config)",
     )
     parser.add_argument(
         "--debug-logs",
@@ -2224,6 +2281,11 @@ if __name__ == "__main__":
         "--override-model-name",
         type=str,
         help="Override model name in requests (overrides config)",
+    )
+    parser.add_argument(
+        "--parallel-limits",
+        type=str,
+        help="Override parallel limits as JSON string. Example: '{\"global\": 10, \"model-name\": 2}' (overrides config)",
     )
 
     args = parser.parse_args()
@@ -2282,8 +2344,45 @@ if __name__ == "__main__":
         OVERRIDE_CONFIG["model_name"] = OVERRIDE_MODEL_NAME
         print(f"Override model_name from command line: {OVERRIDE_MODEL_NAME}")
 
+    # Load parallel request limits and initialize semaphores
+    # Command-line --parallel-limits overrides config if provided
+    parallel_limits_raw = CONFIG.get("parallel_limits", {})
+    if args.parallel_limits:
+        try:
+            parsed_limits = json.loads(args.parallel_limits)
+            if isinstance(parsed_limits, dict):
+                parallel_limits_raw = parsed_limits
+                print(f"Parallel limits from command line: {parsed_limits}")
+            else:
+                print(f"WARNING: --parallel-limits must be a JSON object. Ignoring invalid input: {args.parallel_limits}")
+        except json.JSONDecodeError as e:
+            print(f"WARNING: Invalid JSON in --parallel-limits: {e}. Ignoring.")
+    
+    # Extract and remove the special "global" key before iterating model limits
+    GLOBAL_LIMIT = parallel_limits_raw.pop("global", None)
+    GLOBAL_SEMAPHORE = None
+    if GLOBAL_LIMIT is not None:
+        if isinstance(GLOBAL_LIMIT, int) and GLOBAL_LIMIT > 0:
+            GLOBAL_SEMAPHORE = asyncio.Semaphore(GLOBAL_LIMIT)
+            print(f"Global parallel limit: {GLOBAL_LIMIT} concurrent request(s) across all models")
+        else:
+            print(f"WARNING: Invalid global parallel limit: {GLOBAL_LIMIT}. Must be a positive integer. Skipping.")
+    else:
+        print("No global parallel limit configured.")
+    
+    PARALLEL_LIMITS = {k.lower(): v for k, v in parallel_limits_raw.items()}
+    MODEL_SEMAPHORES = {}
+    for model_name, limit in PARALLEL_LIMITS.items():
+        if isinstance(limit, int) and limit > 0:
+            MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(limit)
+            print(f"Parallel limit: model '{model_name}' limited to {limit} concurrent request(s)")
+        else:
+            print(f"WARNING: Invalid parallel limit for model '{model_name}': {limit}. Must be a positive integer. Skipping.")
+    if not PARALLEL_LIMITS:
+        print("No per-model parallel request limits configured.")
+
     print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
-    print(f"Proxying requests to OpenAI Compatible backend at {TARGET_BASE_URL}")
+    print(f"Proxying requests to upstream server at {TARGET_BASE_URL}")
     print(f"Server capabilities: OpenAI={SERVER_SUPPORTS_OPENAI}, Anthropic={SERVER_SUPPORTS_ANTHROPIC}")
     print(f"Debug logs are {'ENABLED' if ENABLE_DEBUG_LOGS else 'DISABLED'}.")
     print(f"Override logs are {'ENABLED' if ENABLE_OVERRIDE_LOGS else 'DISABLED'}.")

@@ -14,7 +14,13 @@
     "enable_override_logs": false,
     "enable_validation_logs": true
   },
-  "default_sampling_params": {},
+  "default_sampling_params": {
+    "top_p": null,
+    "min_p": null,
+    "top_k": null,
+    "repetition_penalty": null,
+    "temperature": null
+  },
   "override": {
     "only_anthropic": false,
     "model_name": null,
@@ -35,5 +41,14 @@
     "retry_base_delay_seconds": 1.0,
     "retry_multiplier": 2.0,
     "confidence_threshold": 0.85
+  },
+  "parallel_limits": {
+    "global": 2,
+    "glm-4.5-air": 5,
+    "glm-4.6": 3,
+    "glm-4.7": 2,
+    "glm-5": 2,
+    "glm-5.1": 2,
+    "glm-5-Turbo": 1
   }
 }
