@@ -237,7 +237,7 @@ client = None
 
 def get_model_semaphore(model_name: str):
     """Get the semaphore for a model if a parallel limit is configured. Returns None if no limit."""
-    return MODEL_SEMAPHORES.get(model_name)
+    return MODEL_SEMAPHORES.get(model_name.lower())
 
 def get_global_semaphore():
     """Get the global semaphore if a global limit is configured. Returns None if no limit."""
@@ -1187,7 +1187,7 @@ async def proxy_target_requests(path: str, request: Request):
         # Then acquire model-specific semaphore (if configured)
         model_semaphore = get_model_semaphore(model_name)
         if model_semaphore is not None:
-            limit = PARALLEL_LIMITS.get(model_name)
+            limit = PARALLEL_LIMITS.get(model_name.lower())
             if model_semaphore._value == 0:
                 waiting = len(model_semaphore._waiters) if model_semaphore._waiters else 0
                 log_info(request_id, f"Queueing for {model_name}, {waiting} requests waiting (limit: {limit})")
@@ -2211,7 +2211,7 @@ async def proxy_target_requests(path: str, request: Request):
         # Release semaphores in reverse order of acquisition (model first, then global)
         if model_semaphore is not None:
             model_semaphore.release()
-            limit = PARALLEL_LIMITS.get(model_name)
+            limit = PARALLEL_LIMITS.get(model_name.lower())
             used = limit - model_semaphore._value
             log_info(request_id, f"Slot released {model_name}, used: {used}/{limit}")
         if global_semaphore is not None:
@@ -2370,7 +2370,7 @@ if __name__ == "__main__":
     else:
         print("No global parallel limit configured.")
     
-    PARALLEL_LIMITS = parallel_limits_raw
+    PARALLEL_LIMITS = {k.lower(): v for k, v in parallel_limits_raw.items()}
     MODEL_SEMAPHORES = {}
     for model_name, limit in PARALLEL_LIMITS.items():
         if isinstance(limit, int) and limit > 0:
