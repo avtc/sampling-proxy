@@ -207,6 +207,10 @@ VALIDATION_CONFIG = {"enabled": False}
 PARALLEL_LIMITS = {}
 MODEL_SEMAPHORES = {}
 
+# Global parallel request limit (across all models)
+GLOBAL_LIMIT = None
+GLOBAL_SEMAPHORE = None
+
 # List of API path suffixes that are considered "generation" endpoints.
 # Note: We check if the path ENDS WITH these suffixes to handle various prefixes
 GENERATION_ENDPOINT_SUFFIXES = [
@@ -234,6 +238,10 @@ client = None
 def get_model_semaphore(model_name: str):
     """Get the semaphore for a model if a parallel limit is configured. Returns None if no limit."""
     return MODEL_SEMAPHORES.get(model_name)
+
+def get_global_semaphore():
+    """Get the global semaphore if a global limit is configured. Returns None if no limit."""
+    return GLOBAL_SEMAPHORE
 
 # --- FastAPI Application Lifespan Setup ---
 @asynccontextmanager
@@ -318,7 +326,7 @@ async def read_root():
         "generation_endpoints_monitored": GENERATION_ENDPOINT_SUFFIXES,
         "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
         "debug_logs_enabled": ENABLE_DEBUG_LOGS,
-        "parallel_limits": PARALLEL_LIMITS,
+        "parallel_limits": {**({"global": GLOBAL_LIMIT} if GLOBAL_LIMIT is not None else {}), **PARALLEL_LIMITS},
     }
 
 def parse_sse_to_response(sse_text: str) -> Optional[dict]:
@@ -1160,21 +1168,31 @@ async def proxy_target_requests(path: str, request: Request):
             print(f"DEBUG: Not a POST generation request (is_generation_request={is_generation_request}, method={request.method}). Proxying raw body without modification.")
         request_content = await request.body()
 
-    # --- Parallel Limit Semaphore ---
-    # If a parallel limit is configured for this model, acquire a slot before forwarding.
-    # The semaphore is released after the response is fully sent (streaming or not).
-    semaphore = None
+    # --- Parallel Limit Semaphores ---
+    # Acquire both global and model-specific semaphores if configured.
+    # Semaphores are released after the response is fully sent (streaming or not).
+    global_semaphore = None
+    model_semaphore = None
     if is_generation_request and request.method == "POST" and model_name:
-        semaphore = get_model_semaphore(model_name)
-        if semaphore is not None:
+        # Acquire global semaphore first (if configured)
+        global_semaphore = get_global_semaphore()
+        if global_semaphore is not None:
+            if global_semaphore._value == 0:
+                waiting = len(global_semaphore._waiters) if global_semaphore._waiters else 0
+                log_info(request_id, f"Queueing for global limit, {waiting} requests waiting (limit: {GLOBAL_LIMIT})")
+            await global_semaphore.acquire()
+            used = GLOBAL_LIMIT - global_semaphore._value
+            log_info(request_id, f"Global slot acquired, used: {used}/{GLOBAL_LIMIT}")
+        
+        # Then acquire model-specific semaphore (if configured)
+        model_semaphore = get_model_semaphore(model_name)
+        if model_semaphore is not None:
             limit = PARALLEL_LIMITS.get(model_name)
-            # Check if slot is available - if not, log queue status before waiting
-            if semaphore._value == 0:
-                # Count how many are waiting (excluding current request)
-                waiting = len(semaphore._waiters) if semaphore._waiters else 0
+            if model_semaphore._value == 0:
+                waiting = len(model_semaphore._waiters) if model_semaphore._waiters else 0
                 log_info(request_id, f"Queueing for {model_name}, {waiting} requests waiting (limit: {limit})")
-            await semaphore.acquire()
-            used = limit - semaphore._value
+            await model_semaphore.acquire()
+            used = limit - model_semaphore._value
             log_info(request_id, f"Slot acquired {model_name}, used: {used}/{limit}")
 
     # --- Forward Request and Handle Response ---
@@ -2190,13 +2208,16 @@ async def proxy_target_requests(path: str, request: Request):
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     finally:
         # --- Parallel Limit Semaphore Release ---
-        # Release the semaphore if it was acquired
-        if semaphore is not None:
-            semaphore.release()
+        # Release semaphores in reverse order of acquisition (model first, then global)
+        if model_semaphore is not None:
+            model_semaphore.release()
             limit = PARALLEL_LIMITS.get(model_name)
-            # After release, _value reflects the new available count
-            used = limit - semaphore._value
+            used = limit - model_semaphore._value
             log_info(request_id, f"Slot released {model_name}, used: {used}/{limit}")
+        if global_semaphore is not None:
+            global_semaphore.release()
+            used = GLOBAL_LIMIT - global_semaphore._value
+            log_info(request_id, f"Global slot released, used: {used}/{GLOBAL_LIMIT}")
 
 # --- Main execution block for direct script execution ---
 if __name__ == "__main__":
@@ -2261,6 +2282,11 @@ if __name__ == "__main__":
         type=str,
         help="Override model name in requests (overrides config)",
     )
+    parser.add_argument(
+        "--parallel-limits",
+        type=str,
+        help="Override parallel limits as JSON string. Example: '{\"global\": 10, \"model-name\": 2}' (overrides config)",
+    )
 
     args = parser.parse_args()
 
@@ -2293,18 +2319,6 @@ if __name__ == "__main__":
     VALIDATION_CONFIG["enable_validation_logs"] = ENABLE_VALIDATION_LOGS
     print(f"Validation config loaded: enabled={VALIDATION_CONFIG.get('enabled')}, mid_stream_enabled={VALIDATION_CONFIG.get('mid_stream_validation_enabled')}")
 
-    # Load parallel request limits and initialize semaphores
-    PARALLEL_LIMITS = CONFIG.get("parallel_limits", {})
-    MODEL_SEMAPHORES = {}
-    for model_name, limit in PARALLEL_LIMITS.items():
-        if isinstance(limit, int) and limit > 0:
-            MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(limit)
-            print(f"Parallel limit: model '{model_name}' limited to {limit} concurrent request(s)")
-        else:
-            print(f"WARNING: Invalid parallel limit for model '{model_name}': {limit}. Must be a positive integer. Skipping.")
-    if not PARALLEL_LIMITS:
-        print("No parallel request limits configured.")
-
     # Parse override parameters from command line if provided (takes precedence over config)
     if args.override_sampling_params:
         try:
@@ -2329,6 +2343,43 @@ if __name__ == "__main__":
         OVERRIDE_MODEL_NAME = args.override_model_name
         OVERRIDE_CONFIG["model_name"] = OVERRIDE_MODEL_NAME
         print(f"Override model_name from command line: {OVERRIDE_MODEL_NAME}")
+
+    # Load parallel request limits and initialize semaphores
+    # Command-line --parallel-limits overrides config if provided
+    parallel_limits_raw = CONFIG.get("parallel_limits", {})
+    if args.parallel_limits:
+        try:
+            parsed_limits = json.loads(args.parallel_limits)
+            if isinstance(parsed_limits, dict):
+                parallel_limits_raw = parsed_limits
+                print(f"Parallel limits from command line: {parsed_limits}")
+            else:
+                print(f"WARNING: --parallel-limits must be a JSON object. Ignoring invalid input: {args.parallel_limits}")
+        except json.JSONDecodeError as e:
+            print(f"WARNING: Invalid JSON in --parallel-limits: {e}. Ignoring.")
+    
+    # Extract and remove the special "global" key before iterating model limits
+    GLOBAL_LIMIT = parallel_limits_raw.pop("global", None)
+    GLOBAL_SEMAPHORE = None
+    if GLOBAL_LIMIT is not None:
+        if isinstance(GLOBAL_LIMIT, int) and GLOBAL_LIMIT > 0:
+            GLOBAL_SEMAPHORE = asyncio.Semaphore(GLOBAL_LIMIT)
+            print(f"Global parallel limit: {GLOBAL_LIMIT} concurrent request(s) across all models")
+        else:
+            print(f"WARNING: Invalid global parallel limit: {GLOBAL_LIMIT}. Must be a positive integer. Skipping.")
+    else:
+        print("No global parallel limit configured.")
+    
+    PARALLEL_LIMITS = parallel_limits_raw
+    MODEL_SEMAPHORES = {}
+    for model_name, limit in PARALLEL_LIMITS.items():
+        if isinstance(limit, int) and limit > 0:
+            MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(limit)
+            print(f"Parallel limit: model '{model_name}' limited to {limit} concurrent request(s)")
+        else:
+            print(f"WARNING: Invalid parallel limit for model '{model_name}': {limit}. Must be a positive integer. Skipping.")
+    if not PARALLEL_LIMITS:
+        print("No per-model parallel request limits configured.")
 
     print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
     print(f"Proxying requests to upstream server at {TARGET_BASE_URL}")

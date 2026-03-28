@@ -57,6 +57,7 @@
     "confidence_threshold": 0.85
   },
   "parallel_limits": {
+    "global": 999,
     "example-model": 2
   }
 }
