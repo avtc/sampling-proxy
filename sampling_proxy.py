@@ -1204,7 +1204,7 @@ async def proxy_target_requests(path: str, request: Request):
             # Log request start with attempt info
             max_retries = VALIDATION_CONFIG.get("max_retries", 3)
             max_attempts = 1 + max_retries
-            log_info(request_id, f"Request started 1/{max_attempts}")
+            log_info(request_id, f"Request started")
 
             if ENABLE_DEBUG_LOGS:
                 print(f"DEBUG: Sending {'streaming' if is_streaming_request else 'non-streaming'} request.")
@@ -1367,10 +1367,11 @@ async def proxy_target_requests(path: str, request: Request):
                                 )
                                 retry_response = await client.send(retry_request_obj, stream=True)
                                 if retry_response.status_code == 200:
+                                    log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                     current_response = retry_response
                                     continue
                                 else:
-                                    log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                    log_info(request_id, f"WARNING: Retry attempt {attempt}/{max_attempts} failed with status {retry_response.status_code}")
                                     await retry_response.aclose()
                                     break
 
@@ -1424,10 +1425,11 @@ async def proxy_target_requests(path: str, request: Request):
                                     )
                                     retry_response = await client.send(retry_request_obj, stream=True)
                                     if retry_response.status_code == 200:
+                                        log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                         current_response = retry_response
                                         continue
                                     else:
-                                        log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        log_info(request_id, f"WARNING: Retry attempt {attempt}/{max_attempts} failed with status {retry_response.status_code}")
                                         await retry_response.aclose()
                                         for chunk in chunks:
                                             yield chunk
@@ -1558,10 +1560,11 @@ async def proxy_target_requests(path: str, request: Request):
                                 )
                                 retry_response = await client.send(retry_request_obj, stream=True)
                                 if retry_response.status_code == 200:
+                                    log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                     current_response = retry_response
                                     continue
                                 else:
-                                    log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                    log_info(request_id, f"WARNING: Retry attempt {attempt}/{max_attempts} failed with status {retry_response.status_code}")
                                     await retry_response.aclose()
                                     response_text = buffer.get_content().decode('utf-8')
                                     anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
@@ -1623,10 +1626,11 @@ async def proxy_target_requests(path: str, request: Request):
                                     )
                                     retry_response = await client.send(retry_request_obj, stream=True)
                                     if retry_response.status_code == 200:
+                                        log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                         current_response = retry_response
                                         continue
                                     else:
-                                        log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        log_info(request_id, f"WARNING: Retry attempt {attempt}/{max_attempts} failed with status {retry_response.status_code}")
                                         await retry_response.aclose()
                                         anthropic_chunks = convert_openai_sse_to_anthropic_chunks(response_text)
                                         for ac in anthropic_chunks:
@@ -1762,10 +1766,11 @@ async def proxy_target_requests(path: str, request: Request):
                                 )
                                 retry_response = await client.send(retry_request_obj, stream=True)
                                 if retry_response.status_code == 200:
+                                    log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                     current_response = retry_response
                                     continue
                                 else:
-                                    log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                    log_info(request_id, f"WARNING: Retry attempt {attempt}/{max_attempts} failed with status {retry_response.status_code}")
                                     await retry_response.aclose()
                                     for chunk in buffer.get_chunks():
                                         yield chunk
@@ -1821,10 +1826,11 @@ async def proxy_target_requests(path: str, request: Request):
                                     )
                                     retry_response = await client.send(retry_request_obj, stream=True)
                                     if retry_response.status_code == 200:
+                                        log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                         current_response = retry_response
                                         continue
                                     else:
-                                        log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
+                                        log_info(request_id, f"WARNING: Retry attempt {attempt}/{max_attempts} failed with status {retry_response.status_code}")
                                         await retry_response.aclose()
                                         for chunk in chunks:
                                             yield chunk
@@ -2125,6 +2131,7 @@ async def proxy_target_requests(path: str, request: Request):
                             await asyncio.sleep(delay)
 
                         # Make retry request
+                        log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                         retry_response = await client.request(
                             method="POST",
                             url=target_url,
@@ -2137,7 +2144,7 @@ async def proxy_target_requests(path: str, request: Request):
                             await retry_response.aclose()
                         else:
                             # Retry request failed, use last response
-                            log_info(request_id, f"WARNING: Retry request failed with status {retry_response.status_code}")
+                            log_info(request_id, f"WARNING: Retry attempt {attempt}/{max_attempts} failed with status {retry_response.status_code}")
                             await retry_response.aclose()
                             break
 
