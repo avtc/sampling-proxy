@@ -609,6 +609,29 @@ def build_anthropic_error_stream(error_response: dict):
     yield b"event: message_stop\ndata: {}\n\n"
 
 
+def build_anthropic_error_json(issue_type: Optional[str], saved_path: str) -> dict:
+    """
+    Build an Anthropic-format error JSON response for non-streaming requests.
+
+    Returns a dict matching Anthropic's error response format.
+    """
+    issue_display = {
+        "repetition": "Repetition loop"
+    }.get(issue_type, "Unknown issue")
+
+    return {
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": (
+                f"Garbage output detected ({issue_display}). "
+                f"After multiple retries, the model continues to produce invalid output. "
+                f"Raw response saved to: {saved_path}"
+            )
+        }
+    }
+
+
 def build_openai_error_stream(error_response: dict):
     """
     Generator that yields OpenAI SSE error stream events.
@@ -623,6 +646,29 @@ def build_openai_error_stream(error_response: dict):
     error_chunk = {"id": "error", "choices": [{"delta": {"content": error_text}}]}
     yield f"data: {json.dumps(error_chunk)}\n\n".encode()
     yield b"data: [DONE]\n\n"
+
+
+def build_openai_error_json(issue_type: Optional[str], saved_path: str) -> dict:
+    """
+    Build an OpenAI-format error JSON response for non-streaming requests.
+
+    Returns a dict matching OpenAI's error response format.
+    """
+    issue_display = {
+        "repetition": "Repetition loop"
+    }.get(issue_type, "Unknown issue")
+
+    return {
+        "error": {
+            "message": (
+                f"Garbage output detected ({issue_display}). "
+                f"After multiple retries, the model continues to produce invalid output. "
+                f"Raw response saved to: {saved_path}"
+            ),
+            "type": "server_error",
+            "code": "validation_failed"
+        }
+    }
 
 
 async def calculate_retry_delay(attempt: int, config: dict) -> float:

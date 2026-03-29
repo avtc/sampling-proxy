@@ -39,7 +39,9 @@ from validator import (
     count_words_in_text,
     extract_text_from_sse_chunks,
     build_anthropic_error_stream,
-    build_openai_error_stream
+    build_openai_error_stream,
+    build_anthropic_error_json,
+    build_openai_error_json
 )
 
 
@@ -613,6 +615,19 @@ def convert_openai_sse_to_anthropic_chunks(sse_text: str) -> list:
         anthropic_chunks.append({'type': 'message_stop'})
 
     return anthropic_chunks
+
+class _StatusStreamingResponse(StreamingResponse):
+    """StreamingResponse that allows the async generator to override the status code before any bytes are sent."""
+    def __init__(self, content, status_holder: dict, **kwargs):
+        super().__init__(content, **kwargs)
+        self._status_holder = status_holder
+
+    async def __call__(self, scope, receive, send):
+        # Override status code if the generator set it
+        if "status_code" in self._status_holder:
+            self.status_code = self._status_holder["status_code"]
+        await super().__call__(scope, receive, send)
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_target_requests(path: str, request: Request):
@@ -1267,6 +1282,7 @@ async def proxy_target_requests(path: str, request: Request):
 
                     # Capture outer scope variable to avoid UnboundLocalError
                     initial_response = target_response
+                    stream_status_holder = {}
 
                     async def buffered_stream_with_validation():
                         nonlocal initial_response
@@ -1345,7 +1361,8 @@ async def proxy_target_requests(path: str, request: Request):
                                 log_info(request_id, f"Validation failed (confidence: {confidence:.2f}, issue: {issue_type}) see: {saved_path}")
 
                                 if attempt >= max_attempts:
-                                    # Return error message as stream
+                                    # Return error message as stream with proper error status code
+                                    stream_status_holder["status_code"] = 529
                                     error_response = create_error_message(issue_type, saved_path)
                                     for event in build_anthropic_error_stream(error_response):
                                         yield event
@@ -1405,6 +1422,7 @@ async def proxy_target_requests(path: str, request: Request):
                                     log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                                     if attempt >= max_attempts:
+                                        stream_status_holder["status_code"] = 529
                                         error_response = create_error_message(validation_result.issue_type, saved_path)
                                         for event in build_anthropic_error_stream(error_response):
                                             yield event
@@ -1447,8 +1465,9 @@ async def proxy_target_requests(path: str, request: Request):
                                     yield chunk
                                 return
 
-                    return StreamingResponse(
+                    return _StatusStreamingResponse(
                         buffered_stream_with_validation(),
+                        status_holder=stream_status_holder,
                         status_code=target_response.status_code,
                         headers=response_headers,
                         media_type=response_headers.get("content-type"),
@@ -1462,6 +1481,7 @@ async def proxy_target_requests(path: str, request: Request):
 
                     # Capture outer scope variable to avoid UnboundLocalError
                     initial_openai_response = target_response
+                    openai_convert_status_holder = {}
 
                     async def buffered_openai_stream_with_validation():
                         nonlocal initial_openai_response
@@ -1539,6 +1559,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 log_info(request_id, f"Validation failed (confidence: {buffer.get_detection_confidence():.2f}, issue: {issue_type}) see: {saved_path}")
 
                                 if attempt >= max_attempts:
+                                    openai_convert_status_holder["status_code"] = 529
                                     error_response = create_error_message(issue_type, saved_path)
                                     for event in build_anthropic_error_stream(error_response):
                                         yield event
@@ -1606,6 +1627,7 @@ async def proxy_target_requests(path: str, request: Request):
                                     log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                                     if attempt >= max_attempts:
+                                        openai_convert_status_holder["status_code"] = 529
                                         error_response = create_error_message(validation_result.issue_type, saved_path)
                                         for event in build_anthropic_error_stream(error_response):
                                             yield event
@@ -1650,8 +1672,9 @@ async def proxy_target_requests(path: str, request: Request):
                                     yield chunk
                                 return
 
-                    return StreamingResponse(
+                    return _StatusStreamingResponse(
                         buffered_openai_stream_with_validation(),
+                        status_holder=openai_convert_status_holder,
                         status_code=target_response.status_code,
                         headers=response_headers,
                         media_type=response_headers.get("content-type"),
@@ -1661,6 +1684,8 @@ async def proxy_target_requests(path: str, request: Request):
                 if (not is_anthropic_request and
                     should_passthrough_openai and
                     VALIDATION_CONFIG.get("enabled", False)):
+
+                    openai_passthrough_status_holder = {}
 
                     async def buffered_openai_passthrough_stream_with_validation():
                         max_retries = VALIDATION_CONFIG.get("max_retries", 3)
@@ -1745,6 +1770,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 log_info(request_id, f"Validation failed (confidence: {buffer.get_detection_confidence():.2f}, issue: {issue_type}) see: {saved_path}")
 
                                 if attempt >= max_attempts:
+                                    openai_passthrough_status_holder["status_code"] = 529
                                     error_response = create_error_message(issue_type, saved_path)
                                     for event in build_openai_error_stream(error_response):
                                         yield event
@@ -1806,6 +1832,7 @@ async def proxy_target_requests(path: str, request: Request):
                                     log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                                     if attempt >= max_attempts:
+                                        openai_passthrough_status_holder["status_code"] = 529
                                         error_response = create_error_message(validation_result.issue_type, saved_path)
                                         for event in build_openai_error_stream(error_response):
                                             yield event
@@ -1848,8 +1875,9 @@ async def proxy_target_requests(path: str, request: Request):
                                     yield chunk
                                 return
 
-                    return StreamingResponse(
+                    return _StatusStreamingResponse(
                         buffered_openai_passthrough_stream_with_validation(),
+                        status_holder=openai_passthrough_status_holder,
                         status_code=target_response.status_code,
                         headers=response_headers,
                         media_type=response_headers.get("content-type"),
@@ -2083,6 +2111,7 @@ async def proxy_target_requests(path: str, request: Request):
                         print("DEBUG: OpenAI passthrough mode - keeping response format")
 
                 # Validation logic for all modes (anthropic passthrough, openai convert, openai passthrough)
+                validation_failed = False
                 if (VALIDATION_CONFIG.get("enabled", False) and
                     target_response.status_code == 200):
 
@@ -2120,8 +2149,12 @@ async def proxy_target_requests(path: str, request: Request):
                         log_info(request_id, f"Validation failed (confidence: {validation_result.confidence:.2f}, issue: {validation_result.issue_type}) see: {saved_path}")
 
                         if attempt >= max_attempts:
-                            # Max attempts reached, return error message
-                            error_response = create_error_message(validation_result.issue_type, saved_path)
+                            # Max attempts reached, return error with proper status code
+                            validation_failed = True
+                            if is_anthropic_request:
+                                error_response = build_anthropic_error_json(validation_result.issue_type, saved_path)
+                            else:
+                                error_response = build_openai_error_json(validation_result.issue_type, saved_path)
                             response_content = json.dumps(error_response).encode('utf-8')
                             break
 
@@ -2161,9 +2194,9 @@ async def proxy_target_requests(path: str, request: Request):
                 
                 return Response(
                     content=response_content,
-                    status_code=target_response.status_code,
+                    status_code=529 if validation_failed else target_response.status_code,
                     headers=clean_headers,
-                    media_type=target_response.headers.get("content-type"),
+                    media_type="application/json" if validation_failed else target_response.headers.get("content-type"),
                 )
         else:
             if ENABLE_DEBUG_LOGS:
