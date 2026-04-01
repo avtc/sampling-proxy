@@ -651,115 +651,149 @@ async def proxy_target_requests(path: str, request: Request):
     if ENABLE_DEBUG_LOGS:
         print(f"DEBUG: Normalized path for matching: '{path}' (Original: '{original_path}')")
 
-    # Handle Anthropic-specific endpoints locally
+    # Handle Anthropic-specific endpoints
     if path in ANTHROPIC_ENDPOINTS:
-        if ENABLE_DEBUG_LOGS:
-            print(f"DEBUG: Handling Anthropic endpoint '{path}' locally")
-        
-        if path == "api/event_logging/batch":
-            # Handle event logging endpoint - return success response
+        if SERVER_SUPPORTS_ANTHROPIC:
+            # In Anthropic passthrough mode, proxy these endpoints upstream as-is
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Processing event logging request")
-            
+                print(f"DEBUG: Passthrough Anthropic endpoint '{path}' to upstream")
+
+            target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
+            passthrough_headers = dict(request.headers)
+            passthrough_headers.pop("host", None)
+            passthrough_headers.pop("content-length", None)
+            passthrough_body = await request.body()
+
             try:
-                # Read the request body to acknowledge receipt
-                body = await request.body()
-                if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Event logging body received: {len(body)} bytes")
-                
-                # Return a success response that mimics what Anthropic expects
-                response_data = {
-                    "status": "success",
-                    "message": "Events logged successfully"
-                }
-                
+                upstream_response = await client.request(
+                    method=request.method,
+                    url=target_path,
+                    headers=passthrough_headers,
+                    content=passthrough_body,
+                    timeout=TIMEOUT_SECONDS,
+                )
                 return Response(
-                    content=json.dumps(response_data),
-                    status_code=200,
-                    media_type="application/json"
+                    content=upstream_response.content,
+                    status_code=upstream_response.status_code,
+                    media_type=upstream_response.headers.get("content-type", "application/json"),
                 )
             except Exception as e:
                 if ENABLE_DEBUG_LOGS:
-                    print(f"ERROR: Error processing event logging: {e}")
+                    print(f"ERROR: Failed to proxy '{path}' upstream: {e}")
                 return Response(
-                    content=json.dumps({"error": "Failed to process events"}),
-                    status_code=500,
+                    content=json.dumps({"error": {"type": "api_error", "message": f"Failed to proxy request upstream: {str(e)}"}}),
+                    status_code=502,
                     media_type="application/json"
                 )
-        
-        elif path == "v1/messages/count_tokens":
-            # Handle token counting endpoint
+        else:
+            # In conversion mode, handle locally
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Processing token counting request")
-            
-            try:
-                # Read and parse the request body
-                body = await request.body()
+                print(f"DEBUG: Handling Anthropic endpoint '{path}' locally")
+
+            if path == "api/event_logging/batch":
+                # Handle event logging endpoint - return success response
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Token counting body received: {len(body)} bytes")
-                
-                request_data = json.loads(body.decode('utf-8'))
-                messages = request_data.get("messages", [])
-                model = request_data.get("model", "claude-3-sonnet-20241022")
-                
+                    print(f"DEBUG: Processing event logging request")
+
+                try:
+                    # Read the request body to acknowledge receipt
+                    body = await request.body()
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"DEBUG: Event logging body received: {len(body)} bytes")
+
+                    # Return a success response that mimics what Anthropic expects
+                    response_data = {
+                        "status": "success",
+                        "message": "Events logged successfully"
+                    }
+
+                    return Response(
+                        content=json.dumps(response_data),
+                        status_code=200,
+                        media_type="application/json"
+                    )
+                except Exception as e:
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"ERROR: Error processing event logging: {e}")
+                    return Response(
+                        content=json.dumps({"error": "Failed to process events"}),
+                        status_code=500,
+                        media_type="application/json"
+                    )
+
+            elif path == "v1/messages/count_tokens":
+                # Handle token counting endpoint
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Token counting request - model: {model}, messages: {messages}")
-                
-                # Simple token estimation (rough approximation)
-                # In a real implementation, you might want to use a proper tokenizer
-                total_tokens = 0
-                for message in messages:
-                    content = message.get("content", "")
-                    if isinstance(content, list):
-                        # Handle complex content format
-                        for content_item in content:
-                            if isinstance(content_item, dict) and content_item.get("type") == "text":
-                                text = content_item.get("text", "")
-                                # Rough estimation: ~4 characters per token for English text
-                                total_tokens += len(text) // 4 + 1
-                            elif isinstance(content_item, str):
-                                total_tokens += len(content_item) // 4 + 1
-                    elif isinstance(content, str):
-                        total_tokens += len(content) // 4 + 1
-                    else:
-                        total_tokens += len(str(content)) // 4 + 1
-                
-                # Return response in Anthropic format
-                response_data = {
-                    "input_tokens": total_tokens
-                }
-                
-                if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Token counting result: {total_tokens} tokens")
-                
-                return Response(
-                    content=json.dumps(response_data),
-                    status_code=200,
-                    media_type="application/json"
-                )
-            except json.JSONDecodeError as e:
-                if ENABLE_DEBUG_LOGS:
-                    print(f"ERROR: Invalid JSON in token counting request: {e}")
-                return Response(
-                    content=json.dumps({"error": {"type": "invalid_request_error", "message": "Invalid JSON"}}),
-                    status_code=400,
-                    media_type="application/json"
-                )
-            except Exception as e:
-                if ENABLE_DEBUG_LOGS:
-                    print(f"ERROR: Error processing token counting: {e}")
-                return Response(
-                    content=json.dumps({"error": {"type": "api_error", "message": "Failed to count tokens"}}),
-                    status_code=500,
-                    media_type="application/json"
-                )
-        
-        # For any other Anthropic endpoints, return a generic success
-        return Response(
-            content=json.dumps({"status": "ok"}),
-            status_code=200,
-            media_type="application/json"
-        )
+                    print(f"DEBUG: Processing token counting request")
+
+                try:
+                    # Read and parse the request body
+                    body = await request.body()
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"DEBUG: Token counting body received: {len(body)} bytes")
+
+                    request_data = json.loads(body.decode('utf-8'))
+                    messages = request_data.get("messages", [])
+                    model = request_data.get("model", "claude-3-sonnet-20241022")
+
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"DEBUG: Token counting request - model: {model}, messages: {messages}")
+
+                    # Simple token estimation (rough approximation)
+                    # In a real implementation, you might want to use a proper tokenizer
+                    total_tokens = 0
+                    for message in messages:
+                        content = message.get("content", "")
+                        if isinstance(content, list):
+                            # Handle complex content format
+                            for content_item in content:
+                                if isinstance(content_item, dict) and content_item.get("type") == "text":
+                                    text = content_item.get("text", "")
+                                    # Rough estimation: ~4 characters per token for English text
+                                    total_tokens += len(text) // 4 + 1
+                                elif isinstance(content_item, str):
+                                    total_tokens += len(content_item) // 4 + 1
+                        elif isinstance(content, str):
+                            total_tokens += len(content) // 4 + 1
+                        else:
+                            total_tokens += len(str(content)) // 4 + 1
+
+                    # Return response in Anthropic format
+                    response_data = {
+                        "input_tokens": total_tokens
+                    }
+
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"DEBUG: Token counting result: {total_tokens} tokens")
+
+                    return Response(
+                        content=json.dumps(response_data),
+                        status_code=200,
+                        media_type="application/json"
+                    )
+                except json.JSONDecodeError as e:
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"ERROR: Invalid JSON in token counting request: {e}")
+                    return Response(
+                        content=json.dumps({"error": {"type": "invalid_request_error", "message": "Invalid JSON"}}),
+                        status_code=400,
+                        media_type="application/json"
+                    )
+                except Exception as e:
+                    if ENABLE_DEBUG_LOGS:
+                        print(f"ERROR: Error processing token counting: {e}")
+                    return Response(
+                        content=json.dumps({"error": {"type": "api_error", "message": "Failed to count tokens"}}),
+                        status_code=500,
+                        media_type="application/json"
+                    )
+
+            # For any other Anthropic endpoints, return a generic success
+            return Response(
+                content=json.dumps({"status": "ok"}),
+                status_code=200,
+                media_type="application/json"
+            )
 
     # Prepare headers for the outgoing request to upstream server.
     # We copy the incoming headers and remove 'host' and 'content-length'
