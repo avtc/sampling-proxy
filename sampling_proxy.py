@@ -664,10 +664,21 @@ async def proxy_target_requests(path: str, request: Request):
             passthrough_headers.pop("content-length", None)
             passthrough_body = await request.body()
 
+            # Strip TARGET_BASE_PATH to avoid doubling it (httpx client has base_url set)
+            if TARGET_BASE_PATH and target_path.startswith(TARGET_BASE_PATH):
+                relative_path = target_path[len(TARGET_BASE_PATH):]
+                if relative_path and not relative_path.startswith('/'):
+                    relative_path = '/' + relative_path
+            else:
+                relative_path = target_path
+
+            # Preserve query string from original request
+            passthrough_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
+
             try:
                 upstream_response = await client.request(
                     method=request.method,
-                    url=target_path,
+                    url=passthrough_url,
                     headers=passthrough_headers,
                     content=passthrough_body,
                     timeout=TIMEOUT_SECONDS,
