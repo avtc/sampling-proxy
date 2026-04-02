@@ -681,7 +681,6 @@ async def proxy_target_requests(path: str, request: Request):
                     url=passthrough_url,
                     headers=passthrough_headers,
                     content=passthrough_body,
-                    timeout=TIMEOUT_SECONDS,
                 )
                 return Response(
                     content=upstream_response.content,
