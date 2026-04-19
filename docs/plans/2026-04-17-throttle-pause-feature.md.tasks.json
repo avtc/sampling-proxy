@@ -1,0 +1,22 @@
+{
+  "planPath": "docs/plans/2026-04-17-throttle-pause-feature.md",
+  "tasks": [
+    {"id": 0, "subject": "Task 0: Add Throttle Config Schema to load_config()", "status": "completed"},
+    {"id": 1, "subject": "Task 1: Create ThrottleManager and ModelThrottle Classes", "status": "completed", "blockedBy": [0]},
+    {"id": 2, "subject": "Task 2: Implement wait_before_send() Method", "status": "completed", "blockedBy": [1]},
+    {"id": 3, "subject": "Task 3: Implement wait_after_send() Method", "status": "completed", "blockedBy": [2]},
+    {"id": 4, "subject": "Task 4: Add Config Validation", "status": "completed", "blockedBy": [3]},
+    {"id": 5, "subject": "Task 5: Add Logging to ThrottleManager", "status": "completed", "blockedBy": [4]},
+    {"id": 6, "subject": "Task 6: Integrate ThrottleManager into sampling_proxy.py - Config Loading", "status": "completed", "blockedBy": [5]},
+    {"id": 7, "subject": "Task 7: Initialize ThrottleManager in Main Block", "status": "completed", "blockedBy": [6]},
+    {"id": 8, "subject": "Task 8: Add Throttle Calls to Anthropic Passthrough Path", "status": "completed", "blockedBy": [7]},
+    {"id": 9, "subject": "Task 9: Add Throttle Calls to Streaming Validation Retry Path", "status": "completed", "blockedBy": [8]},
+    {"id": 10, "subject": "Task 10: Extract Model Name Helper Function", "status": "completed", "blockedBy": [9]},
+    {"id": 11, "subject": "Task 11: Update Config Sample Files", "status": "completed", "blockedBy": [10]},
+    {"id": 12, "subject": "Task 12: Update README.md Documentation", "status": "completed", "blockedBy": [11]},
+    {"id": 13, "subject": "Task 13: Integration Test - End-to-End", "status": "completed", "blockedBy": [12]},
+    {"id": 14, "subject": "Task 14: Manual Testing and Verification", "status": "pending", "blockedBy": [13]},
+    {"id": 15, "subject": "Task 15: Final Cleanup and Documentation", "status": "completed", "blockedBy": [14]}
+  ],
+  "lastUpdated": "2026-04-17T12:45:00Z"
+}

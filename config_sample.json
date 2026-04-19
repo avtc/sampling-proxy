@@ -59,5 +59,13 @@
   "parallel_limits": {
     "global": 999,
     "example-model": 2
+  },
+  "throttle": {
+    "enabled": false,
+    "global": {
+      "start_pause_seconds": null,
+      "end_pause_seconds": null
+    },
+    "per_model": {}
   }
 }

@@ -44,6 +44,9 @@ from validator import (
     build_openai_error_json
 )
 
+# Import throttle manager for request throttling
+from throttle_manager import ThrottleManager
+
 
 def load_config(config_path="config.json"):
     """
@@ -87,7 +90,15 @@ def load_config(config_path="config.json"):
             "mid_stream_validation_enabled": False,
             "mid_stream_validation_interval_words": 300
         },
-        "parallel_limits": {}
+        "parallel_limits": {},
+        "throttle": {
+            "enabled": False,
+            "global": {
+                "start_pause_seconds": None,
+                "end_pause_seconds": None
+            },
+            "per_model": {}
+        }
     }
     
     if not os.path.exists(config_path):
@@ -204,6 +215,7 @@ MODEL_SAMPLING_PARAMS = {}
 SERVER_SUPPORTS_OPENAI = True
 SERVER_SUPPORTS_ANTHROPIC = False
 VALIDATION_CONFIG = {"enabled": False}
+THROTTLE_CONFIG = {"enabled": False}
 
 # Per-model parallel request limits (model_name -> asyncio.Semaphore)
 PARALLEL_LIMITS = {}
@@ -212,6 +224,9 @@ MODEL_SEMAPHORES = {}
 # Global parallel request limit (across all models)
 GLOBAL_LIMIT = None
 GLOBAL_SEMAPHORE = None
+
+# Throttle manager for request pacing
+throttle_manager = None
 
 # List of API path suffixes that are considered "generation" endpoints.
 # Note: We check if the path ENDS WITH these suffixes to handle various prefixes
@@ -240,6 +255,13 @@ client = None
 def get_model_semaphore(model_name: str):
     """Get the semaphore for a model if a parallel limit is configured. Returns None if no limit."""
     return MODEL_SEMAPHORES.get(model_name.lower())
+
+def extract_model_for_throttle(request_data: dict) -> str:
+    """Extract model name from request data for throttle lookup."""
+    model = request_data.get("model")
+    if model:
+        return model
+    return "global"
 
 def get_global_semaphore():
     """Get the global semaphore if a global limit is configured. Returns None if no limit."""
@@ -682,6 +704,7 @@ async def proxy_target_requests(path: str, request: Request):
                     headers=passthrough_headers,
                     content=passthrough_body,
                 )
+
                 return Response(
                     content=upstream_response.content,
                     status_code=upstream_response.status_code,
@@ -1278,9 +1301,13 @@ async def proxy_target_requests(path: str, request: Request):
                     content=request_content,
                 )
                 # Send the request and get the raw response object, enabling streaming
+                if throttle_manager:
+                    await throttle_manager.wait_before_send(model_name, request_id)
                 target_response = await client.send(target_request_obj, stream=True)
             else:
                 # For non-streaming requests, fetch the full response
+                if throttle_manager:
+                    await throttle_manager.wait_before_send(model_name, request_id)
                 target_response = await client.request(
                     method=request.method,
                     url=target_url,
@@ -1419,6 +1446,8 @@ async def proxy_target_requests(path: str, request: Request):
                                     await asyncio.sleep(delay)
 
                                 # Use streaming for retry (same as initial request)
+                                if throttle_manager:
+                                    await throttle_manager.wait_before_send(model_name, request_id)
                                 retry_request_obj = client.build_request(
                                     method=request.method,
                                     url=target_url,
@@ -1479,6 +1508,8 @@ async def proxy_target_requests(path: str, request: Request):
                                         await asyncio.sleep(delay)
 
                                     # Use streaming for retry (same as initial request)
+                                    if throttle_manager:
+                                        await throttle_manager.wait_before_send(model_name, request_id)
                                     retry_request_obj = client.build_request(
                                         method="POST",
                                         url=target_url,
@@ -1616,6 +1647,8 @@ async def proxy_target_requests(path: str, request: Request):
                                     await asyncio.sleep(delay)
 
                                 # Use streaming for retry (same as initial request)
+                                if throttle_manager:
+                                    await throttle_manager.wait_before_send(model_name, request_id)
                                 retry_request_obj = client.build_request(
                                     method=request.method,
                                     url=target_url,
@@ -1684,6 +1717,8 @@ async def proxy_target_requests(path: str, request: Request):
                                         await asyncio.sleep(delay)
 
                                     # Use streaming for retry (same as initial request)
+                                    if throttle_manager:
+                                        await throttle_manager.wait_before_send(model_name, request_id)
                                     retry_request_obj = client.build_request(
                                         method="POST",
                                         url=target_url,
@@ -1827,6 +1862,8 @@ async def proxy_target_requests(path: str, request: Request):
                                     await asyncio.sleep(delay)
 
                                 # Use streaming for retry (same as initial request)
+                                if throttle_manager:
+                                    await throttle_manager.wait_before_send(model_name, request_id)
                                 retry_request_obj = client.build_request(
                                     method=request.method,
                                     url=target_url,
@@ -1889,6 +1926,8 @@ async def proxy_target_requests(path: str, request: Request):
                                         await asyncio.sleep(delay)
 
                                     # Use streaming for retry (same as initial request)
+                                    if throttle_manager:
+                                        await throttle_manager.wait_before_send(model_name, request_id)
                                     retry_request_obj = client.build_request(
                                         method="POST",
                                         url=target_url,
@@ -2209,6 +2248,8 @@ async def proxy_target_requests(path: str, request: Request):
 
                         # Make retry request
                         log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
+                        if throttle_manager:
+                            await throttle_manager.wait_before_send(model_name, request_id)
                         retry_response = await client.request(
                             method="POST",
                             url=target_url,
@@ -2302,6 +2343,10 @@ async def proxy_target_requests(path: str, request: Request):
             global_semaphore.release()
             used = GLOBAL_LIMIT - global_semaphore._value
             log_info(request_id, f"Global slot released, used: {used}/{GLOBAL_LIMIT}")
+
+        # --- Throttle After Send (generation requests only) ---
+        if throttle_manager and is_generation_request and request.method == "POST":
+            await throttle_manager.wait_after_send(model_name, request_id)
 
 # --- Main execution block for direct script execution ---
 if __name__ == "__main__":
@@ -2403,6 +2448,10 @@ if __name__ == "__main__":
     VALIDATION_CONFIG["enable_validation_logs"] = ENABLE_VALIDATION_LOGS
     print(f"Validation config loaded: enabled={VALIDATION_CONFIG.get('enabled')}, mid_stream_enabled={VALIDATION_CONFIG.get('mid_stream_validation_enabled')}")
 
+    # Load throttle configuration
+    THROTTLE_CONFIG = CONFIG.get("throttle", {"enabled": False})
+    print(f"Throttle config loaded: enabled={THROTTLE_CONFIG.get('enabled')}")
+
     # Parse override parameters from command line if provided (takes precedence over config)
     if args.override_sampling_params:
         try:
@@ -2464,6 +2513,16 @@ if __name__ == "__main__":
             print(f"WARNING: Invalid parallel limit for model '{model_name}': {limit}. Must be a positive integer. Skipping.")
     if not PARALLEL_LIMITS:
         print("No per-model parallel request limits configured.")
+
+    # Initialize throttle manager
+    throttle_manager = None
+    if THROTTLE_CONFIG.get("enabled"):
+        try:
+            throttle_manager = ThrottleManager(THROTTLE_CONFIG, ENABLE_DEBUG_LOGS, 0)
+            print(f"Throttle manager initialized: enabled={throttle_manager.enabled}")
+        except ValueError as e:
+            print(f"ERROR: Invalid throttle configuration: {e}")
+            raise
 
     print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
     print(f"Proxying requests to upstream server at {TARGET_BASE_URL}")

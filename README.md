@@ -7,6 +7,7 @@ A middleware server for OpenAI-compatible backends with passthrough (OpenAI/Anth
 - **Passthrough Modes**: OpenAI, Anthropic, and Anthropic-to-OpenAI conversion
 - **Parameter Override**: Apply custom sampling parameters per model
 - **Parallel Request Limits**: Limit concurrent requests per model with automatic queueing
+- **Request Throttling:** Configurable cooldown delays between requests per model
 - **Streaming Support**: Both streaming and non-streaming responses
 - **Garbage Detection**: Validate responses and auto-retry when garbage output is detected
 - **Mid-Stream Validation**: Detect garbage during generation (not just at the end)
@@ -122,6 +123,35 @@ When limit is reached, additional requests queue automatically. Logs show queue 
 [INFO] Slot acquired GLM-5, used: 2/2
 [INFO] Slot released GLM-5, used: 1/2
 ```
+
+## Request Throttling
+
+Add cooldown delays between requests to prevent backend overload:
+
+```json
+{
+  "throttle": {
+    "enabled": true,
+    "global": {
+      "start_pause_seconds": null,
+      "end_pause_seconds": null
+    },
+    "per_model": {
+      "GLM-5-turbo": {
+        "start_pause_seconds": 1.0,
+        "end_pause_seconds": 5.0
+      }
+    }
+  }
+}
+```
+
+**Timers:**
+- **start_pause_seconds:** Cooldown after sending a request (delays the next request)
+- **end_pause_seconds:** Cooldown after response completes (delays the next request)
+- `null` disables the timer (default)
+
+Per-model settings override global. Both timers default to `null` (disabled).
 
 ## API Endpoints
 

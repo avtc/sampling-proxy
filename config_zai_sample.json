@@ -50,5 +50,13 @@
     "glm-5": 2,
     "glm-5.1": 2,
     "glm-5-Turbo": 1
+  },
+  "throttle": {
+    "enabled": false,
+    "global": {
+      "start_pause_seconds": null,
+      "end_pause_seconds": null
+    },
+    "per_model": {}
   }
 }
