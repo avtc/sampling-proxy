@@ -938,6 +938,7 @@ async def proxy_target_requests(path: str, request: Request):
                         # Extract Anthropic format data
                         anthropic_messages = incoming_json_body.get("messages", [])
                         anthropic_model = incoming_json_body.get("model")
+                        anthropic_system = incoming_json_body.get("system")
                         anthropic_max_tokens = incoming_json_body.get("max_tokens")
                         anthropic_temperature = incoming_json_body.get("temperature")
                         anthropic_top_p = incoming_json_body.get("top_p")
@@ -947,6 +948,14 @@ async def proxy_target_requests(path: str, request: Request):
                     
                         # Convert Anthropic messages to OpenAI format
                         openai_messages = []
+                        if anthropic_system:
+                            system_text = anthropic_system if isinstance(anthropic_system, str) else "\n".join(
+                                block.get("text", "") for block in anthropic_system if isinstance(block, dict) and block.get("type") == "text"
+                            )
+                            if system_text:
+                                openai_messages.append({"role": "system", "content": system_text})
+                                if ENABLE_DEBUG_LOGS:
+                                    print(f"DEBUG: Converted Anthropic top-level system prompt to OpenAI system message ({len(system_text)} chars)")
                         for msg_idx, msg in enumerate(anthropic_messages):
                             try:
                                 # Map Anthropic roles to OpenAI roles
@@ -1086,6 +1095,11 @@ async def proxy_target_requests(path: str, request: Request):
                         if anthropic_top_p is not None:
                             openai_request["top_p"] = anthropic_top_p
                     
+                        # Convert stop_sequences to stop
+                        anthropic_stop_sequences = incoming_json_body.get("stop_sequences")
+                        if anthropic_stop_sequences:
+                            openai_request["stop"] = anthropic_stop_sequences
+
                         # Convert tools if present
                         if anthropic_tools:
                             openai_tools = []
@@ -1108,10 +1122,11 @@ async def proxy_target_requests(path: str, request: Request):
                         if anthropic_tool_choice:
                             if anthropic_tool_choice == "auto":
                                 openai_request["tool_choice"] = "auto"
+                            elif anthropic_tool_choice == "any":
+                                openai_request["tool_choice"] = "required"
                             elif anthropic_tool_choice == "none":
                                 openai_request["tool_choice"] = "none"
                             elif isinstance(anthropic_tool_choice, dict):
-                                # Handle specific tool choice
                                 tool_name = anthropic_tool_choice.get("name")
                                 if tool_name:
                                     openai_request["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
