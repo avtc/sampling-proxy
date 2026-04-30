@@ -1793,62 +1793,55 @@ async def proxy_target_requests(path: str, request: Request):
 
                             # Use unified buffer with mid-stream validation
                             buffer = StreamingValidationBuffer(VALIDATION_CONFIG, ENABLE_DEBUG_LOGS)
-                            progress = BufferingProgress()
-                            progress.start(attempt, max_attempts, buffer)
 
-                            try:
-                                # Stream with immediate garbage detection interrupt
-                                chunk_iterator = current_response.aiter_bytes()
-                                garbage_event = buffer.get_garbage_event()
-                                stream_done = False
-                                garbage_interrupted = False
+                            # Stream with immediate garbage detection interrupt
+                            chunk_iterator = current_response.aiter_bytes()
+                            garbage_event = buffer.get_garbage_event()
+                            stream_done = False
+                            garbage_interrupted = False
 
-                                while not stream_done:
-                                    # Create task for reading next chunk
-                                    read_task = asyncio.create_task(chunk_iterator.__anext__())
-                                    # Create task for waiting on garbage event
-                                    garbage_wait_task = asyncio.create_task(garbage_event.wait())
+                            while not stream_done:
+                                # Create task for reading next chunk
+                                read_task = asyncio.create_task(chunk_iterator.__anext__())
+                                # Create task for waiting on garbage event
+                                garbage_wait_task = asyncio.create_task(garbage_event.wait())
 
-                                    done, pending = await asyncio.wait(
-                                        [read_task, garbage_wait_task],
-                                        return_when=asyncio.FIRST_COMPLETED
-                                    )
+                                done, pending = await asyncio.wait(
+                                    [read_task, garbage_wait_task],
+                                    return_when=asyncio.FIRST_COMPLETED
+                                )
 
-                                    # Cancel pending tasks
-                                    for task in pending:
-                                        task.cancel()
-                                        try:
-                                            await task
-                                        except asyncio.CancelledError:
-                                            pass
+                                # Cancel pending tasks
+                                for task in pending:
+                                    task.cancel()
+                                    try:
+                                        await task
+                                    except asyncio.CancelledError:
+                                        pass
 
-                                    if garbage_wait_task in done:
-                                        # Garbage detected - close connection immediately to stop upstream
-                                        garbage_interrupted = True
-                                        await current_response.aclose()
-                                        break
-
-                                    if read_task in done:
-                                        try:
-                                            chunk = read_task.result()
-                                            if not await buffer.add_chunk(chunk):
-                                                # Garbage detected in add_chunk - close immediately
-                                                garbage_interrupted = True
-                                                await current_response.aclose()
-                                                break
-                                            # Update progress after chunk is processed
-                                            progress.update()
-                                        except StopAsyncIteration:
-                                            stream_done = True  # Stream ended normally
-                                        except Exception:
-                                            break  # Other error
-
-                                # Only wait for validation if not already interrupted
-                                if not garbage_interrupted:
-                                    await buffer.wait_for_pending_validation()
+                                if garbage_wait_task in done:
+                                    # Garbage detected - close connection immediately to stop upstream
+                                    garbage_interrupted = True
                                     await current_response.aclose()
-                            finally:
-                                progress.finalize()
+                                    break
+
+                                if read_task in done:
+                                    try:
+                                        chunk = read_task.result()
+                                        if not await buffer.add_chunk(chunk):
+                                            # Garbage detected in add_chunk - close immediately
+                                            garbage_interrupted = True
+                                            await current_response.aclose()
+                                            break
+                                    except StopAsyncIteration:
+                                        stream_done = True  # Stream ended normally
+                                    except Exception:
+                                        break  # Other error
+
+                            # Only wait for validation if not already interrupted
+                            if not garbage_interrupted:
+                                await buffer.wait_for_pending_validation()
+                                await current_response.aclose()
 
                             # Handle mid-stream garbage detection
                             if buffer.is_garbage_detected():
