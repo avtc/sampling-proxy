@@ -14,7 +14,7 @@ import threading
 # Configure logger
 logger = logging.getLogger("sampling_proxy")
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(levelname)s:     %(message)s",
 )
 
