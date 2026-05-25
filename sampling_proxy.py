@@ -1306,6 +1306,7 @@ async def proxy_target_requests(path: str, request: Request):
 
     # Helper to release semaphores after streaming completes
     semaphores_released = False
+    is_streaming_response = False
 
     async def release_semaphores():
         nonlocal semaphores_released
@@ -1325,6 +1326,8 @@ async def proxy_target_requests(path: str, request: Request):
 
     def wrap_stream_with_semaphore_release(generator):
         """Wrap an async generator to release semaphores when streaming completes."""
+        nonlocal is_streaming_response
+        is_streaming_response = True
         async def wrapped():
             try:
                 async for chunk in generator:
@@ -2382,10 +2385,10 @@ async def proxy_target_requests(path: str, request: Request):
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     finally:
         # --- Parallel Limit Semaphore Release ---
-        # For non-streaming responses, release semaphores here.
         # For streaming responses, semaphores are released by wrap_stream_with_semaphore_release()
-        # when the stream completes.
-        if not semaphores_released:
+        # when the stream completes. Do NOT release here — the finally runs when the handler
+        # returns the StreamingResponse, NOT when streaming finishes.
+        if not is_streaming_response and not semaphores_released:
             await release_semaphores()
 
         # --- Throttle After Send (generation requests only) ---
