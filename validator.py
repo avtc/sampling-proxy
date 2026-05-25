@@ -4,10 +4,13 @@ Uses a local or remote model via OpenAI-compatible or Anthropic-compatible API t
 """
 
 import json
+import logging
 import asyncio
 from dataclasses import dataclass
 from typing import Optional, Literal
 from datetime import datetime
+
+logger = logging.getLogger("sampling_proxy.validator")
 from pathlib import Path
 import httpx
 
@@ -239,7 +242,7 @@ async def call_validator_model(content: str, config: dict) -> dict:
 
         if response.status_code != 200:
             if enable_logs:
-                print(f"WARN: Validator returned {response.status_code}")
+                logger.warning(f" Validator returned {response.status_code}")
             raise httpx.HTTPStatusError(
                 f"Validator returned {response.status_code}: {response.text}",
                 request=None,
@@ -328,13 +331,13 @@ def parse_validator_response(response: dict, config: dict) -> ValidationResult:
 
     except json.JSONDecodeError as e:
         # If we can't parse, assume valid (fail-open for parser errors)
-        print(f"WARN: Validation parse error: {e}")
+        logger.warning(f" Validation parse error: {e}")
         return ValidationResult(
             is_valid=True,
             error=f"Failed to parse validator response: {e}"
         )
     except Exception as e:
-        print(f"WARN: Validation error: {type(e).__name__}: {e}")
+        logger.warning(f" Validation error: {type(e).__name__}: {e}")
         return ValidationResult(
             is_valid=True,
             error=f"Validator parse error: {type(e).__name__}: {e}"
@@ -359,7 +362,7 @@ async def validate_response(response: dict, config: dict) -> ValidationResult:
         return ValidationResult(is_valid=True)
 
     word_count = count_words_in_text(extract_content_from_response(response))
-    print(f"INFO: Validation started ({word_count} words, final)")
+    logger.info(f" Validation started ({word_count} words, final)")
 
     try:
         content = extract_content_from_response(response)
@@ -371,27 +374,27 @@ async def validate_response(response: dict, config: dict) -> ValidationResult:
         result = parse_validator_response(raw_result, config)
 
         if result.error:
-            print(f"WARN: Validation error: {result.error}")
+            logger.warning(f" Validation error: {result.error}")
         elif result.is_valid:
-            print(f"INFO: Validation passed (is_valid={result.is_valid}, issue_type={result.issue_type}, confidence={result.confidence:.2f})")
+            logger.info(f" Validation passed (is_valid={result.is_valid}, issue_type={result.issue_type}, confidence={result.confidence:.2f})")
 
         return result
 
     except httpx.HTTPStatusError as e:
-        print(f"WARN: Validation HTTP error: {e}")
+        logger.warning(f" Validation HTTP error: {e}")
         return ValidationResult(
             is_valid=True,  # Fail-open
             error=f"Validator HTTP error: {e}"
         )
     except httpx.RequestError as e:
-        print(f"WARN: Validation connection error: {e}")
+        logger.warning(f" Validation connection error: {e}")
         return ValidationResult(
             is_valid=True,  # Fail-open
             error=f"Validator connection error: {e}"
         )
     except Exception as e:
         import traceback
-        print(f"WARN: Validation error: {type(e).__name__}: {e}")
+        logger.warning(f" Validation error: {type(e).__name__}: {e}")
         traceback.print_exc()
         return ValidationResult(
             is_valid=True,  # Fail-open
@@ -468,20 +471,20 @@ async def validate_response_partial(content: str, config: dict) -> ValidationRes
                 )
 
             if response.status_code != 200:
-                print(f"WARN: Validator error {response.status_code}")
+                logger.warning(f" Validator error {response.status_code}")
                 return ValidationResult(is_valid=True, error=f"Validator HTTP {response.status_code}")
 
             raw_result = response.json()
             return parse_validator_response(raw_result, config)
 
     except httpx.HTTPStatusError as e:
-        print(f"WARN: Validation HTTP error: {e}")
+        logger.warning(f" Validation HTTP error: {e}")
         return ValidationResult(is_valid=True, error=f"HTTP error: {e}")
     except httpx.RequestError as e:
-        print(f"WARN: Validation connection error: {e}")
+        logger.warning(f" Validation connection error: {e}")
         return ValidationResult(is_valid=True, error=f"Connection error: {e}")
     except Exception as e:
-        print(f"WARN: Validation error: {type(e).__name__}: {e}")
+        logger.warning(f" Validation error: {type(e).__name__}: {e}")
         return ValidationResult(is_valid=True, error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
@@ -752,22 +755,22 @@ class StreamingValidator:
     async def _validate_partial(self, content: str, config: dict):
         """Validate partial content, signal if garbage detected."""
         word_count = count_words_in_text(content)
-        print(f"INFO: Validation started ({word_count} words, mid-stream)")
+        logger.info(f" Validation started ({word_count} words, mid-stream)")
         try:
             result = await validate_response_partial(content, config)
             if result.error:
                 # Validation itself failed (e.g., connection error)
-                print(f"WARN: Validation error: {result.error}")
+                logger.warning(f" Validation error: {result.error}")
             elif not result.is_valid:
                 # Garbage detected - log is handled by caller
                 self.detected_issue_type = result.issue_type
                 self._detected_confidence = result.confidence
                 self.garbage_detected.set()
             else:
-                print(f"INFO: Validation passed (is_valid={result.is_valid}, issue_type={result.issue_type}, confidence={result.confidence:.2f})")
+                logger.info(f" Validation passed (is_valid={result.is_valid}, issue_type={result.issue_type}, confidence={result.confidence:.2f})")
         except Exception as e:
             # Log but don't signal garbage on validator errors (fail-open)
-            print(f"WARN: Validation error: {e}")
+            logger.warning(f" Validation error: {e}")
 
     def is_garbage_detected(self) -> bool:
         """Check if garbage was detected by any validator task."""
@@ -779,7 +782,7 @@ class StreamingValidator:
             try:
                 await asyncio.wait_for(self.validator_task, timeout=30.0)
             except asyncio.TimeoutError:
-                print("VALIDATION [mid-stream]: Validator task timeout")
+                logger.info("VALIDATION [mid-stream]: Validator task timeout")
 
     def get_detection_info(self) -> Optional[str]:
         """Get info about detection (for logging)."""

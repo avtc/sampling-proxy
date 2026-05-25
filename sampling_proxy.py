@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import httpx
 from typing import Optional
 from fastapi import FastAPI, Request, Response, status
@@ -9,6 +10,13 @@ import uvicorn
 import asyncio # Import asyncio for potential sleep
 import argparse # Import argparse for command-line arguments
 import threading
+
+# Configure logger
+logger = logging.getLogger("sampling_proxy")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:     %(message)s",
+)
 
 # Global request counter for log correlation
 _request_counter = 0
@@ -22,8 +30,8 @@ def get_request_id():
         return _request_counter
 
 def log_info(request_id: int, message: str):
-    """Print info log with request ID prefix."""
-    print(f"[INFO][R:{request_id}] {message}")
+    """Log info with request ID prefix."""
+    logger.info("[R:%s] %s", request_id, message)
 
 # Import validator module for garbage detection
 from validator import (
@@ -102,7 +110,7 @@ def load_config(config_path="config.json"):
     }
     
     if not os.path.exists(config_path):
-        print(f"WARNING: Config file '{config_path}' not found. Using default values.")
+        logger.warning(f"Config file '{config_path}' not found. Using default values.")
         return default_config
     
     try:
@@ -147,14 +155,14 @@ def load_config(config_path="config.json"):
                     filtered_model_params[model] = filtered_params
             merged_config["model_sampling_params"] = filtered_model_params
         
-        print(f"Configuration loaded from '{config_path}'")
+        logger.info(f"Configuration loaded from '{config_path}'")
         return merged_config
         
     except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON in config file '{config_path}': {e}. Using default values.")
+        logger.error(f"Invalid JSON in config file '{config_path}': {e}. Using default values.")
         return default_config
     except Exception as e:
-        print(f"ERROR: Error loading config file '{config_path}': {e}. Using default values.")
+        logger.error(f"Error loading config file '{config_path}': {e}. Using default values.")
         return default_config
 
 def extract_base_path(url):
@@ -275,7 +283,7 @@ async def lifespan(app: FastAPI):
     Ensures the httpx client is properly closed when the application shuts down.
     """
     global FIRST_AVAILABLE_MODEL, client
-    print("FastAPI application startup.")
+    logger.info("FastAPI application startup.")
 
     # Initialize client with the correct TARGET_BASE_URL and timeout from config
     connect_timeout = CONFIG["server"].get("connect_timeout_seconds", 5.0)
@@ -301,31 +309,31 @@ async def lifespan(app: FastAPI):
             models_path = "/models"
 
         try:
-            print(f"Polling {TARGET_BASE_URL}{models_path} to get available models...")
+            logger.info(f"Polling {TARGET_BASE_URL}{models_path} to get available models...")
             response = await client.get(models_path)
             if response.status_code == 200:
                 models_data = response.json()
                 if "data" in models_data and len(models_data["data"]) > 0:
                     FIRST_AVAILABLE_MODEL = models_data["data"][0]["id"]
-                    print(f"Successfully retrieved first available model: {FIRST_AVAILABLE_MODEL}")
+                    logger.info(f"Successfully retrieved first available model: {FIRST_AVAILABLE_MODEL}")
                 else:
-                    print("WARNING: No models found in /models response")
+                    logger.warning("No models found in /models response")
             else:
-                print(f"WARNING: Failed to get models from {models_path}. Status: {response.status_code}")
+                logger.warning(f"Failed to get models from {models_path}. Status: {response.status_code}")
         except Exception as e:
-            print(f"WARNING: Error polling {models_path}: {e}")
+            logger.warning(f"Error polling {models_path}: {e}")
     elif OVERRIDE_MODEL_NAME:
         # Use the override model name as the first available model
         FIRST_AVAILABLE_MODEL = OVERRIDE_MODEL_NAME
-        print(f"Using override model name: {FIRST_AVAILABLE_MODEL}")
+        logger.info(f"Using override model name: {FIRST_AVAILABLE_MODEL}")
     else:
-        print("Skipping model polling (server doesn't support OpenAI format)")
+        logger.info("Skipping model polling (server doesn't support OpenAI format)")
     
     yield # Application starts here
-    print("FastAPI application shutdown.")
+    logger.info("FastAPI application shutdown.")
     if client:
         await client.aclose()
-        print("HTTPX client closed.")
+        logger.info("HTTPX client closed.")
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
@@ -666,19 +674,19 @@ async def proxy_target_requests(path: str, request: Request):
     request_id = get_request_id()
 
     if ENABLE_DEBUG_LOGS:
-        print(f"\n--- Incoming Request: {request.method} {path} ---")
+        logger.info(f"\n--- Incoming Request: {request.method} {path} ---")
     # Normalize path by removing leading/trailing slashes for consistent matching
     original_path = path
     path = path.strip('/')
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Normalized path for matching: '{path}' (Original: '{original_path}')")
+        logger.debug(f"Normalized path for matching: '{path}' (Original: '{original_path}')")
 
     # Handle Anthropic-specific endpoints
     if path in ANTHROPIC_ENDPOINTS:
         if SERVER_SUPPORTS_ANTHROPIC:
             # In Anthropic passthrough mode, proxy these endpoints upstream as-is
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Passthrough Anthropic endpoint '{path}' to upstream")
+                logger.debug(f"Passthrough Anthropic endpoint '{path}' to upstream")
 
             target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
             passthrough_headers = dict(request.headers)
@@ -712,7 +720,7 @@ async def proxy_target_requests(path: str, request: Request):
                 )
             except Exception as e:
                 if ENABLE_DEBUG_LOGS:
-                    print(f"ERROR: Failed to proxy '{path}' upstream: {e}")
+                    logger.error(f"Failed to proxy '{path}' upstream: {e}")
                 return Response(
                     content=json.dumps({"error": {"type": "api_error", "message": f"Failed to proxy request upstream: {str(e)}"}}),
                     status_code=502,
@@ -721,18 +729,18 @@ async def proxy_target_requests(path: str, request: Request):
         else:
             # In conversion mode, handle locally
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Handling Anthropic endpoint '{path}' locally")
+                logger.debug(f"Handling Anthropic endpoint '{path}' locally")
 
             if path == "api/event_logging/batch":
                 # Handle event logging endpoint - return success response
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Processing event logging request")
+                    logger.debug("Processing event logging request")
 
                 try:
                     # Read the request body to acknowledge receipt
                     body = await request.body()
                     if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Event logging body received: {len(body)} bytes")
+                        logger.debug(f"Event logging body received: {len(body)} bytes")
 
                     # Return a success response that mimics what Anthropic expects
                     response_data = {
@@ -747,7 +755,7 @@ async def proxy_target_requests(path: str, request: Request):
                     )
                 except Exception as e:
                     if ENABLE_DEBUG_LOGS:
-                        print(f"ERROR: Error processing event logging: {e}")
+                        logger.error(f"Error processing event logging: {e}")
                     return Response(
                         content=json.dumps({"error": "Failed to process events"}),
                         status_code=500,
@@ -757,20 +765,20 @@ async def proxy_target_requests(path: str, request: Request):
             elif path == "v1/messages/count_tokens":
                 # Handle token counting endpoint
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Processing token counting request")
+                    logger.debug("Processing token counting request")
 
                 try:
                     # Read and parse the request body
                     body = await request.body()
                     if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Token counting body received: {len(body)} bytes")
+                        logger.debug(f"Token counting body received: {len(body)} bytes")
 
                     request_data = json.loads(body.decode('utf-8'))
                     messages = request_data.get("messages", [])
                     model = request_data.get("model", "claude-3-sonnet-20241022")
 
                     if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Token counting request - model: {model}, messages: {messages}")
+                        logger.debug(f"Token counting request - model: {model}, messages: {messages}")
 
                     # Simple token estimation (rough approximation)
                     # In a real implementation, you might want to use a proper tokenizer
@@ -797,7 +805,7 @@ async def proxy_target_requests(path: str, request: Request):
                     }
 
                     if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Token counting result: {total_tokens} tokens")
+                        logger.debug(f"Token counting result: {total_tokens} tokens")
 
                     return Response(
                         content=json.dumps(response_data),
@@ -806,7 +814,7 @@ async def proxy_target_requests(path: str, request: Request):
                     )
                 except json.JSONDecodeError as e:
                     if ENABLE_DEBUG_LOGS:
-                        print(f"ERROR: Invalid JSON in token counting request: {e}")
+                        logger.error(f"Invalid JSON in token counting request: {e}")
                     return Response(
                         content=json.dumps({"error": {"type": "invalid_request_error", "message": "Invalid JSON"}}),
                         status_code=400,
@@ -814,7 +822,7 @@ async def proxy_target_requests(path: str, request: Request):
                     )
                 except Exception as e:
                     if ENABLE_DEBUG_LOGS:
-                        print(f"ERROR: Error processing token counting: {e}")
+                        logger.error(f"Error processing token counting: {e}")
                     return Response(
                         content=json.dumps({"error": {"type": "api_error", "message": "Failed to count tokens"}}),
                         status_code=500,
@@ -835,7 +843,7 @@ async def proxy_target_requests(path: str, request: Request):
     headers.pop("host", None)
     headers.pop("content-length", None) # httpx will recalculate if body changes
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Outgoing Request Headers (initial): {headers}")
+        logger.debug(f"Outgoing Request Headers (initial): {headers}")
 
     request_content = None # This will hold the request body to be sent to target
     is_generation_request = False
@@ -847,8 +855,8 @@ async def proxy_target_requests(path: str, request: Request):
     is_generation_request = any(path.endswith(suffix) for suffix in GENERATION_ENDPOINT_SUFFIXES)
     is_anthropic_request = path.endswith("v1/messages") # Check if this is an Anthropic request
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: is_generation_request after check: {is_generation_request}")
-        print(f"DEBUG: is_anthropic_request: {is_anthropic_request}")
+        logger.debug(f"is_generation_request after check: {is_generation_request}")
+        logger.debug(f"is_anthropic_request: {is_anthropic_request}")
 
     # Construct the target URL based on server capabilities
     # Determine passthrough mode based on request format and server capabilities
@@ -860,14 +868,14 @@ async def proxy_target_requests(path: str, request: Request):
             # Keep Anthropic path as-is, no conversion
             target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Anthropic passthrough mode - keeping path: {target_path}")
+                logger.debug(f"Anthropic passthrough mode - keeping path: {target_path}")
         else:
             # Convert /v1/messages to /chat/completions for OpenAI-compatible upstream server
             # First apply the path transformation, then change to chat completions
             transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
             target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Converting Anthropic request from {original_path} to {target_path}")
+                logger.debug(f"Converting Anthropic request from {original_path} to {target_path}")
     else:
         if not SERVER_SUPPORTS_OPENAI:
             # OpenAI request but server doesn't support OpenAI - we can't convert OpenAI to Anthropic
@@ -885,8 +893,8 @@ async def proxy_target_requests(path: str, request: Request):
         target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
     
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Path transformation: /{original_path} -> {target_path}")
-        print(f"DEBUG: Base paths - Proxy: {SAMPLING_PROXY_BASE_PATH}, Target: {TARGET_BASE_PATH}")
+        logger.debug(f"Path transformation: /{original_path} -> {target_path}")
+        logger.debug(f"Base paths - Proxy: {SAMPLING_PROXY_BASE_PATH}, Target: {TARGET_BASE_PATH}")
     
     # Since httpx.AsyncClient is created with base_url=TARGET_BASE_URL,
     # we need to provide only the path portion relative to the target base path
@@ -900,38 +908,38 @@ async def proxy_target_requests(path: str, request: Request):
         relative_path = target_path
     
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Relative path for httpx: {relative_path}")
+        logger.debug(f"Relative path for httpx: {relative_path}")
     
     # Ensure the query string is encoded to bytes as required by httpx.URL
     target_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
     if ENABLE_DEBUG_LOGS:
-        print(f"DEBUG: Target upstream URL: {target_url}")
+        logger.debug(f"Target upstream URL: {target_url}")
 
     # --- Sampling Parameter Override Logic ---
     if is_generation_request and request.method == "POST":
         if ENABLE_DEBUG_LOGS:
-            print("DEBUG: This is a POST generation request. Applying override logic.")
+            logger.debug("This is a POST generation request. Applying override logic.")
         try:
             # Attempt to parse the incoming request body as JSON.
             # Generation requests typically send JSON payloads.
             raw_body = await request.body()
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Raw incoming request body: {raw_body.decode('utf-8')}")
+                logger.debug(f"Raw incoming request body: {raw_body.decode('utf-8')}")
             incoming_json_body = json.loads(raw_body) # This will be available for response processing
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Parsed incoming JSON body: {incoming_json_body}")
+                logger.debug(f"Parsed incoming JSON body: {incoming_json_body}")
 
             # Handle Anthropic request based on server capabilities
             if is_anthropic_request:
                 if should_passthrough_anthropic:
                     # Passthrough mode: keep request as-is, but apply sampling params
                     if ENABLE_DEBUG_LOGS:
-                        print("DEBUG: Anthropic passthrough mode - keeping request format")
+                        logger.debug("Anthropic passthrough mode - keeping request format")
                     # Don't modify incoming_json_body - it stays as Anthropic format
                 else:
                     # Convert Anthropic to OpenAI format
                     if ENABLE_DEBUG_LOGS:
-                        print("DEBUG: Converting Anthropic request to OpenAI format.")
+                        logger.debug("Converting Anthropic request to OpenAI format.")
 
                     try:
 
@@ -955,7 +963,7 @@ async def proxy_target_requests(path: str, request: Request):
                             if system_text:
                                 openai_messages.append({"role": "system", "content": system_text})
                                 if ENABLE_DEBUG_LOGS:
-                                    print(f"DEBUG: Converted Anthropic top-level system prompt to OpenAI system message ({len(system_text)} chars)")
+                                    logger.debug(f"Converted Anthropic top-level system prompt to OpenAI system message ({len(system_text)} chars)")
                         for msg_idx, msg in enumerate(anthropic_messages):
                             try:
                                 # Map Anthropic roles to OpenAI roles
@@ -970,7 +978,7 @@ async def proxy_target_requests(path: str, request: Request):
                                     # Default to user for unknown roles
                                     openai_role = "user"
                                     if ENABLE_DEBUG_LOGS:
-                                        print(f"DEBUG: Unknown Anthropic role '{anthropic_role}' mapped to 'user'")
+                                        logger.debug(f"Unknown Anthropic role '{anthropic_role}' mapped to 'user'")
                             
                                 openai_msg = {
                                     "role": openai_role,
@@ -1004,7 +1012,7 @@ async def proxy_target_requests(path: str, request: Request):
                                                 }
                                                 tool_calls.append(tool_call)
                                                 if ENABLE_DEBUG_LOGS:
-                                                    print(f"DEBUG: Converted Anthropic tool_use to OpenAI tool_call: {tool_call}")
+                                                    logger.debug(f"Converted Anthropic tool_use to OpenAI tool_call: {tool_call}")
                                         
                                             elif content_type == "tool_result":
                                                 # Convert Anthropic tool_result to OpenAI tool call format
@@ -1024,7 +1032,7 @@ async def proxy_target_requests(path: str, request: Request):
                                                 
                                                     openai_messages.append(tool_call_msg)
                                                     if ENABLE_DEBUG_LOGS:
-                                                        print(f"DEBUG: Converted Anthropic tool_result to OpenAI tool message: {tool_call_msg}")
+                                                        logger.debug(f"Converted Anthropic tool_result to OpenAI tool message: {tool_call_msg}")
                                     
                                         elif isinstance(content_item, str):
                                             content_parts.append(content_item)
@@ -1057,17 +1065,17 @@ async def proxy_target_requests(path: str, request: Request):
                                     if openai_msg.get("content") or openai_msg.get("tool_calls"):
                                         openai_messages.append(openai_msg)
                                         if ENABLE_DEBUG_LOGS:
-                                            print(f"DEBUG: Converted message {msg_idx}: {openai_msg}")
+                                            logger.debug(f"Converted message {msg_idx}: {openai_msg}")
                                     else:
                                         if ENABLE_DEBUG_LOGS:
-                                            print(f"DEBUG: Skipping empty message {msg_idx}")
+                                            logger.debug(f"Skipping empty message {msg_idx}")
                                 else:
                                     if ENABLE_DEBUG_LOGS:
-                                        print(f"DEBUG: Skipping invalid tool message {msg_idx}")
+                                        logger.debug(f"Skipping invalid tool message {msg_idx}")
                         
                             except Exception as e:
                                 if ENABLE_DEBUG_LOGS:
-                                    print(f"ERROR: Failed to convert message {msg_idx}: {e}")
+                                    logger.error(f"Failed to convert message {msg_idx}: {e}")
                                 # Continue with next message instead of failing completely
                                 continue
                     
@@ -1075,11 +1083,11 @@ async def proxy_target_requests(path: str, request: Request):
                         if OVERRIDE_MODEL_NAME:
                             overridden_model = OVERRIDE_MODEL_NAME
                             if ENABLE_OVERRIDE_LOGS:
-                                print(f"OVERRIDE: Anthropic model '{anthropic_model}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
+                                logger.info(f"OVERRIDE: Anthropic model '{anthropic_model}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
                         else:
                             overridden_model = FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else anthropic_model
                             if ENABLE_DEBUG_LOGS and FIRST_AVAILABLE_MODEL:
-                                print(f"DEBUG: Using first available model '{FIRST_AVAILABLE_MODEL}' for Anthropic request")
+                                logger.debug(f"Using first available model '{FIRST_AVAILABLE_MODEL}' for Anthropic request")
                     
                         # Convert to OpenAI chat completions format
                         openai_request = {
@@ -1116,7 +1124,7 @@ async def proxy_target_requests(path: str, request: Request):
                         
                             openai_request["tools"] = openai_tools
                             if ENABLE_DEBUG_LOGS:
-                                print(f"DEBUG: Converted {len(anthropic_tools)} Anthropic tools to OpenAI format")
+                                logger.debug(f"Converted {len(anthropic_tools)} Anthropic tools to OpenAI format")
                     
                         # Convert tool_choice if present
                         if anthropic_tool_choice:
@@ -1131,12 +1139,12 @@ async def proxy_target_requests(path: str, request: Request):
                                 if tool_name:
                                     openai_request["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
                             if ENABLE_DEBUG_LOGS:
-                                print(f"DEBUG: Converted tool_choice: {anthropic_tool_choice} -> {openai_request.get('tool_choice')}")
+                                logger.debug(f"Converted tool_choice: {anthropic_tool_choice} -> {openai_request.get('tool_choice')}")
                 
                         # Validate the converted messages before proceeding
                         if not openai_messages:
                             if ENABLE_DEBUG_LOGS:
-                                print("ERROR: No valid messages after conversion. Creating fallback message.")
+                                logger.error("No valid messages after conversion. Creating fallback message.")
                             # Create a simple fallback message
                             openai_messages = [{
                                 "role": "user",
@@ -1146,13 +1154,13 @@ async def proxy_target_requests(path: str, request: Request):
                         # Replace the incoming body with converted OpenAI format
                         incoming_json_body = openai_request
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Converted to OpenAI format: {incoming_json_body}")
-                            print(f"DEBUG: Final message count: {len(openai_messages)}")
+                            logger.debug(f"Converted to OpenAI format: {incoming_json_body}")
+                            logger.debug(f"Final message count: {len(openai_messages)}")
                 
                     except Exception as e:
-                        print(f"ERROR: Failed to convert Anthropic request to OpenAI format: {e}")
+                        logger.error(f"Failed to convert Anthropic request to OpenAI format: {e}")
                         if ENABLE_DEBUG_LOGS:
-                            print(f"ERROR: Original Anthropic request: {incoming_json_body}")
+                            logger.error(f"Original Anthropic request: {incoming_json_body}")
                     
                         # Create a minimal valid OpenAI request as fallback
                         fallback_model = OVERRIDE_MODEL_NAME if OVERRIDE_MODEL_NAME else (FIRST_AVAILABLE_MODEL if FIRST_AVAILABLE_MODEL else "gpt-3.5-turbo")
@@ -1164,7 +1172,7 @@ async def proxy_target_requests(path: str, request: Request):
                         }
                     
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Using fallback OpenAI request: {incoming_json_body}")
+                            logger.debug(f"Using fallback OpenAI request: {incoming_json_body}")
 
             # Apply model name override for Anthropic requests in passthrough mode
             if is_anthropic_request and should_passthrough_anthropic:
@@ -1172,12 +1180,12 @@ async def proxy_target_requests(path: str, request: Request):
                     original_model_name = incoming_json_body.get("model")
                     incoming_json_body["model"] = OVERRIDE_MODEL_NAME
                     if ENABLE_OVERRIDE_LOGS:
-                        print(f"OVERRIDE: Anthropic passthrough model '{original_model_name}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
+                        logger.info(f"OVERRIDE: Anthropic passthrough model '{original_model_name}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
 
             # Get the model name from the request
             model_name = incoming_json_body.get("model")
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Model name from request: {model_name}")
+                logger.debug(f"Model name from request: {model_name}")
             
             # Apply model name override for non-Anthropic requests when applicable
             if not is_anthropic_request:
@@ -1187,7 +1195,7 @@ async def proxy_target_requests(path: str, request: Request):
                     model_name = OVERRIDE_MODEL_NAME
                     incoming_json_body["model"] = model_name
                     if ENABLE_OVERRIDE_LOGS:
-                        print(f"OVERRIDE: Non-Anthropic model '{original_model_name}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
+                        logger.info(f"OVERRIDE: Non-Anthropic model '{original_model_name}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
 
             # Determine where sampling parameters are expected in the request body
             # For /generate, they are typically in a 'sampling_params' sub-dictionary
@@ -1196,16 +1204,16 @@ async def proxy_target_requests(path: str, request: Request):
                 current_params_container = incoming_json_body.get("sampling_params", {})
                 is_nested_params = True
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Path is 'generate', using nested 'sampling_params'. Current container: {current_params_container}")
+                    logger.debug(f"Path is 'generate', using nested 'sampling_params'. Current container: {current_params_container}")
             else: # completions, chat/completions, v1/messages (normalized paths)
                 current_params_container = incoming_json_body
                 is_nested_params = False
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Path is OpenAI-compatible, using top-level params. Current container: {current_params_container}")
+                    logger.debug(f"Path is OpenAI-compatible, using top-level params. Current container: {current_params_container}")
 
             model_specific_params = MODEL_SAMPLING_PARAMS.get(model_name, {})
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Model-specific params for '{model_name}': {model_specific_params}")
+                logger.debug(f"Model-specific params for '{model_name}': {model_specific_params}")
 
             # First, apply override parameters - these override incoming parameters based on only_anthropic flag
             if OVERRIDE_SAMPLING_PARAMS:
@@ -1214,14 +1222,14 @@ async def proxy_target_requests(path: str, request: Request):
                 
                 if should_apply_overrides:
                     if ENABLE_OVERRIDE_LOGS:
-                        print(f"OVERRIDE: Applying sampling parameter overrides: {OVERRIDE_SAMPLING_PARAMS}")
+                        logger.info(f"OVERRIDE: Applying sampling parameter overrides: {OVERRIDE_SAMPLING_PARAMS}")
                         if OVERRIDE_ONLY_ANTHROPIC:
-                            print(f"OVERRIDE: Overrides only applied to Anthropic requests (is_anthropic_request={is_anthropic_request})")
+                            logger.info(f"OVERRIDE: Overrides only applied to Anthropic requests (is_anthropic_request={is_anthropic_request})")
                     for param, override_value in OVERRIDE_SAMPLING_PARAMS.items():
                         original_value = current_params_container.get(param, "not_set")
                         current_params_container[param] = override_value
                         if ENABLE_OVERRIDE_LOGS:
-                            print(f"OVERRIDE: '{param}' from '{original_value}' to '{override_value}'")
+                            logger.info(f"OVERRIDE: '{param}' from '{original_value}' to '{override_value}'")
 
             # Then, apply model-specific default parameters (same logic as default_sampling_params, but per-model)
             if model_specific_params:
@@ -1230,14 +1238,14 @@ async def proxy_target_requests(path: str, request: Request):
                         # Skip if this parameter is being overridden (already handled above)
                         if OVERRIDE_SAMPLING_PARAMS and param in OVERRIDE_SAMPLING_PARAMS:
                             if ENABLE_DEBUG_LOGS:
-                                print(f"DEBUG: Parameter '{param}' is overridden, skipping model-specific default application.")
+                                logger.debug(f"Parameter '{param}' is overridden, skipping model-specific default application.")
                             continue
                         current_params_container[param] = model_default_value
                         if ENABLE_OVERRIDE_LOGS:
-                            print(f"DEBUG: [model:{model_name}] Overriding '{param}' to '{model_default_value}' (was not in request).")
+                            logger.debug(f"[model:{model_name}] Overriding '{param}' to '{model_default_value}' (was not in request).")
                     else:
                         if ENABLE_OVERRIDE_LOGS:
-                            print(f"DEBUG: [model:{model_name}] Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
+                            logger.debug(f"[model:{model_name}] Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
 
             # Then, apply global default parameters for any missing parameters not covered by model-specific or overrides
             for param, default_value in DEFAULT_SAMPLING_PARAMS.items():
@@ -1245,14 +1253,14 @@ async def proxy_target_requests(path: str, request: Request):
                     # Skip if this parameter is being overridden (already handled above)
                     if OVERRIDE_SAMPLING_PARAMS and param in OVERRIDE_SAMPLING_PARAMS:
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Parameter '{param}' is overridden, skipping default application.")
+                            logger.debug(f"Parameter '{param}' is overridden, skipping default application.")
                         continue
                     current_params_container[param] = default_value
                     if ENABLE_OVERRIDE_LOGS:
-                        print(f"DEBUG: Overriding '{param}' to '{default_value}' (was not in request).")
+                        logger.debug(f"Overriding '{param}' to '{default_value}' (was not in request).")
                 else:
                     if ENABLE_OVERRIDE_LOGS:
-                        print(f"DEBUG: Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
+                        logger.debug(f"Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
 
             # Re-integrate the modified parameters back into the main body if they were nested
             if is_nested_params:
@@ -1263,18 +1271,18 @@ async def proxy_target_requests(path: str, request: Request):
             headers["content-type"] = "application/json" # Ensure content-type header is correct
 
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Final modified request body: {request_content}")
-                print(f"[{request.method} {original_path}] Overridden sampling params for model '{model_name}': {current_params_container}")
+                logger.debug(f"Final modified request body: {request_content}")
+                logger.info(f"[{request.method} {original_path}] Overridden sampling params for model '{model_name}': {current_params_container}")
 
         except json.JSONDecodeError as e:
-            print(f"ERROR: [{request.method} {original_path}] JSONDecodeError: {e}. Proxying raw body.")
+            logger.error(f"[{request.method} {original_path}] JSONDecodeError: {e}. Proxying raw body.")
             request_content = await request.body()
         except Exception as e:
-            print(f"ERROR: [{request.method} {original_path}] Error processing generation request body: {e}. Proxying raw body.")
+            logger.error(f"[{request.method} {original_path}] Error processing generation request body: {e}. Proxying raw body.")
             request_content = await request.body()
     else:
         if ENABLE_DEBUG_LOGS:
-            print(f"DEBUG: Not a POST generation request (is_generation_request={is_generation_request}, method={request.method}). Proxying raw body without modification.")
+            logger.debug(f"Not a POST generation request (is_generation_request={is_generation_request}, method={request.method}). Proxying raw body without modification.")
         request_content = await request.body()
 
     # --- Parallel Limit Semaphores ---
@@ -1348,7 +1356,7 @@ async def proxy_target_requests(path: str, request: Request):
             log_info(request_id, f"Request started")
 
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Sending {'streaming' if is_streaming_request else 'non-streaming'} request.")
+                logger.debug(f"Sending {'streaming' if is_streaming_request else 'non-streaming'} request.")
 
             if is_streaming_request:
                 # For streaming requests, use streaming
@@ -1380,7 +1388,7 @@ async def proxy_target_requests(path: str, request: Request):
                 # Prepare response headers for streaming
                 response_headers = dict(target_response.headers)
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Upstream Response Headers (raw): {response_headers}")
+                    logger.debug(f"Upstream Response Headers (raw): {response_headers}")
 
                 # Remove headers that interfere with streaming
                 # Use case-insensitive removal to catch all variants
@@ -1399,10 +1407,10 @@ async def proxy_target_requests(path: str, request: Request):
                     response_headers["cache-control"] = "no-cache"
                     response_headers["connection"] = "keep-alive"
                     if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Setting response Content-Type to 'text/event-stream' for streaming request.")
+                        logger.debug("Setting response Content-Type to 'text/event-stream' for streaming request.")
                 else:
                     if ENABLE_DEBUG_LOGS:
-                        print(f"DEBUG: Not an OpenAI-compatible streaming path, keeping original Content-Type: {response_headers.get('content-type', 'N/A')}")
+                        logger.debug(f"Not an OpenAI-compatible streaming path, keeping original Content-Type: {response_headers.get('content-type', 'N/A')}")
 
                 # For streaming with validation in passthrough mode, buffer and validate first
                 # Note: openai_convert streaming validation not yet supported (chunks are converted on-the-fly)
@@ -2135,12 +2143,12 @@ async def proxy_target_requests(path: str, request: Request):
                             yield chunk
                             # await asyncio.sleep(0) # Yield control to event loop, may help with some race conditions
                     except Exception as e:
-                        print(f"ERROR: Exception during streaming chunks: {e}")
+                        logger.error(f"Exception during streaming chunks: {e}")
                         raise # Re-raise to propagate the error
                     finally:
                         # Ensure the httpx response is closed after iteration
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Upstream response connection closed by generator after {chunk_count} chunks.")
+                            logger.debug(f"Upstream response connection closed by generator after {chunk_count} chunks.")
                         await target_response.aclose()
 
                 return StreamingResponse(
@@ -2152,9 +2160,9 @@ async def proxy_target_requests(path: str, request: Request):
             else:
                 # Handle non-streaming response
                 if ENABLE_DEBUG_LOGS:
-                    print(f"DEBUG: Upstream Response Headers (full): {target_response.headers}")
-                    print(f"DEBUG: Upstream Response Status: {target_response.status_code}")
-                    print(f"DEBUG: Upstream Response Content: {target_response.text}")
+                    logger.debug(f"Upstream Response Headers (full): {target_response.headers}")
+                    logger.debug(f"Upstream Response Status: {target_response.status_code}")
+                    logger.debug(f"Upstream Response Content: {target_response.text}")
                 
                 # Handle Anthropic response conversion for non-streaming requests
                 response_content = target_response.content
@@ -2162,9 +2170,9 @@ async def proxy_target_requests(path: str, request: Request):
                 # Log 404 errors specifically for debugging
                 if target_response.status_code == 404:
                     if is_anthropic_request:
-                        print(f"WARNING: Anthropic request to {target_path} returned 404. Upstream server may not support OpenAI chat completions endpoint.")
+                        logger.warning(f"Anthropic request to {target_path} returned 404. Upstream server may not support OpenAI chat completions endpoint.")
                     else:
-                        print(f"WARNING: Request to {target_path} returned 404. Endpoint may not exist on upstream server.")
+                        logger.warning(f"Request to {target_path} returned 404. Endpoint may not exist on upstream server.")
 
                 if is_anthropic_request and not should_passthrough_anthropic and target_response.status_code == 200:
                     try:
@@ -2201,7 +2209,7 @@ async def proxy_target_requests(path: str, request: Request):
                             }
                             anthropic_content.append(anthropic_tool_use)
                             if ENABLE_DEBUG_LOGS:
-                                print(f"DEBUG: Converted OpenAI tool_call to Anthropic tool_use: {anthropic_tool_use}")
+                                logger.debug(f"Converted OpenAI tool_call to Anthropic tool_use: {anthropic_tool_use}")
                         
                         # Convert OpenAI finish_reason to Anthropic stop_reason
                         finish_reason = choice.get("finish_reason", "stop")
@@ -2231,19 +2239,19 @@ async def proxy_target_requests(path: str, request: Request):
                         
                         response_content = json.dumps(anthropic_response).encode('utf-8')
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Converted non-streaming response to Anthropic format")
+                            logger.debug("Converted non-streaming response to Anthropic format")
                             
                     except (json.JSONDecodeError, UnicodeDecodeError, KeyError, IndexError) as e:
                         if ENABLE_DEBUG_LOGS:
-                            print(f"DEBUG: Could not convert response to Anthropic format: {e}. Using original response.")
+                            logger.debug(f"Could not convert response to Anthropic format: {e}. Using original response.")
                         # Keep original response if conversion fails
 
                 elif is_anthropic_request and should_passthrough_anthropic:
                     if ENABLE_DEBUG_LOGS:
-                        print("DEBUG: Anthropic passthrough mode - keeping response format")
+                        logger.debug("Anthropic passthrough mode - keeping response format")
                 elif not is_anthropic_request and should_passthrough_openai:
                     if ENABLE_DEBUG_LOGS:
-                        print("DEBUG: OpenAI passthrough mode - keeping response format")
+                        logger.debug("OpenAI passthrough mode - keeping response format")
 
                 # Validation logic for all modes (anthropic passthrough, openai convert, openai passthrough)
                 validation_failed = False
@@ -2276,7 +2284,7 @@ async def proxy_target_requests(path: str, request: Request):
                         if validation_result.is_valid:
                             # Valid response, proceed
                             if ENABLE_DEBUG_LOGS:
-                                print(f"DEBUG: Response validated successfully (attempt {attempt})")
+                                logger.debug(f"Response validated successfully (attempt {attempt})")
                             break
 
                         # Invalid response - save and retry
@@ -2337,7 +2345,7 @@ async def proxy_target_requests(path: str, request: Request):
                 )
         else:
             if ENABLE_DEBUG_LOGS:
-                print("DEBUG: Sending non-generation request to upstream server.")
+                logger.debug("Sending non-generation request to upstream server.")
             # For all other requests (e.g., GET /models), fetch the full response
             target_response = await client.request(
                 method=request.method,
@@ -2347,12 +2355,12 @@ async def proxy_target_requests(path: str, request: Request):
                 content=request_content,
             )
             if ENABLE_DEBUG_LOGS:
-                print(f"DEBUG: Upstream Response Headers (full): {target_response.headers}")
-                print(f"DEBUG: Upstream Response Status: {target_response.status_code}")
+                logger.debug(f"Upstream Response Headers (full): {target_response.headers}")
+                logger.debug(f"Upstream Response Status: {target_response.status_code}")
             
             # Log 404 errors specifically for debugging
             if target_response.status_code == 404:
-                print(f"WARNING: Non-generation request to {target_path} returned 404. Endpoint may not exist on upstream server.")
+                logger.warning(f"Non-generation request to {target_path} returned 404. Endpoint may not exist on upstream server.")
             
             # Ensure the httpx response is closed after its content is read
             await target_response.aclose()
@@ -2372,15 +2380,15 @@ async def proxy_target_requests(path: str, request: Request):
             )
 
     except httpx.ConnectError as e:
-        print(f"ERROR: [{request.method} {original_path}] Connection error to upstream server: {e}")
+        logger.error(f"[{request.method} {original_path}] Connection error to upstream server: {e}")
         return Response(f"Could not connect to upstream server at {TARGET_BASE_URL}: {e}",
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     except httpx.RequestError as e:
-        print(f"ERROR: [{request.method} {original_path}] Request error to upstream server: {e}")
+        logger.error(f"[{request.method} {original_path}] Request error to upstream server: {e}")
         return Response(f"An error occurred while requesting upstream server: {e}",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
-        print(f"ERROR: [{request.method} {original_path}] An unexpected error occurred: {e}")
+        logger.error(f"[{request.method} {original_path}] An unexpected error occurred: {e}")
         return Response(f"An unexpected error occurred: {e}",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     finally:
@@ -2493,11 +2501,11 @@ if __name__ == "__main__":
     SERVER_SUPPORTS_ANTHROPIC = server_config.get("supports_anthropic", False)
     VALIDATION_CONFIG = CONFIG.get("validation", {"enabled": False})
     VALIDATION_CONFIG["enable_validation_logs"] = ENABLE_VALIDATION_LOGS
-    print(f"Validation config loaded: enabled={VALIDATION_CONFIG.get('enabled')}, mid_stream_enabled={VALIDATION_CONFIG.get('mid_stream_validation_enabled')}")
+    logger.info(f"Validation config loaded: enabled={VALIDATION_CONFIG.get('enabled')}, mid_stream_enabled={VALIDATION_CONFIG.get('mid_stream_validation_enabled')}")
 
     # Load throttle configuration
     THROTTLE_CONFIG = CONFIG.get("throttle", {"enabled": False})
-    print(f"Throttle config loaded: enabled={THROTTLE_CONFIG.get('enabled')}")
+    logger.info(f"Throttle config loaded: enabled={THROTTLE_CONFIG.get('enabled')}")
 
     # Parse override parameters from command line if provided (takes precedence over config)
     if args.override_sampling_params:
@@ -2506,23 +2514,23 @@ if __name__ == "__main__":
             if isinstance(parsed_params, dict):
                 OVERRIDE_SAMPLING_PARAMS = parsed_params
                 OVERRIDE_CONFIG["sampling_params"] = OVERRIDE_SAMPLING_PARAMS
-                print(f"Override sampling parameters from command line: {OVERRIDE_SAMPLING_PARAMS}")
+                logger.info(f"Override sampling parameters from command line: {OVERRIDE_SAMPLING_PARAMS}")
             else:
-                print(f"WARNING: --override-sampling-params must be a JSON object. Ignoring invalid input: {args.override_sampling_params}")
+                logger.warning(f"--override-sampling-params must be a JSON object. Ignoring invalid input: {args.override_sampling_params}")
         except json.JSONDecodeError as e:
-            print(f"WARNING: Invalid JSON in --override-sampling-params: {e}. Ignoring.")
+            logger.warning(f"Invalid JSON in --override-sampling-params: {e}. Ignoring.")
     
     # Handle override-only-anthropic flag from command line
     if args.override_only_anthropic is not None:
         OVERRIDE_ONLY_ANTHROPIC = args.override_only_anthropic
         OVERRIDE_CONFIG["only_anthropic"] = OVERRIDE_ONLY_ANTHROPIC
-        print(f"Override only_anthropic from command line: {OVERRIDE_ONLY_ANTHROPIC}")
+        logger.info(f"Override only_anthropic from command line: {OVERRIDE_ONLY_ANTHROPIC}")
     
     # Handle override-model-name from command line
     if args.override_model_name is not None:
         OVERRIDE_MODEL_NAME = args.override_model_name
         OVERRIDE_CONFIG["model_name"] = OVERRIDE_MODEL_NAME
-        print(f"Override model_name from command line: {OVERRIDE_MODEL_NAME}")
+        logger.info(f"Override model_name from command line: {OVERRIDE_MODEL_NAME}")
 
     # Load parallel request limits and initialize semaphores
     # Command-line --parallel-limits overrides config if provided
@@ -2532,11 +2540,11 @@ if __name__ == "__main__":
             parsed_limits = json.loads(args.parallel_limits)
             if isinstance(parsed_limits, dict):
                 parallel_limits_raw = parsed_limits
-                print(f"Parallel limits from command line: {parsed_limits}")
+                logger.info(f"Parallel limits from command line: {parsed_limits}")
             else:
-                print(f"WARNING: --parallel-limits must be a JSON object. Ignoring invalid input: {args.parallel_limits}")
+                logger.warning(f"--parallel-limits must be a JSON object. Ignoring invalid input: {args.parallel_limits}")
         except json.JSONDecodeError as e:
-            print(f"WARNING: Invalid JSON in --parallel-limits: {e}. Ignoring.")
+            logger.warning(f"Invalid JSON in --parallel-limits: {e}. Ignoring.")
     
     # Extract and remove the special "global" key before iterating model limits
     GLOBAL_LIMIT = parallel_limits_raw.pop("global", None)
@@ -2544,37 +2552,37 @@ if __name__ == "__main__":
     if GLOBAL_LIMIT is not None:
         if isinstance(GLOBAL_LIMIT, int) and GLOBAL_LIMIT > 0:
             GLOBAL_SEMAPHORE = asyncio.Semaphore(GLOBAL_LIMIT)
-            print(f"Global parallel limit: {GLOBAL_LIMIT} concurrent request(s) across all models")
+            logger.info(f"Global parallel limit: {GLOBAL_LIMIT} concurrent request(s) across all models")
         else:
-            print(f"WARNING: Invalid global parallel limit: {GLOBAL_LIMIT}. Must be a positive integer. Skipping.")
+            logger.warning(f"Invalid global parallel limit: {GLOBAL_LIMIT}. Must be a positive integer. Skipping.")
     else:
-        print("No global parallel limit configured.")
+        logger.info("No global parallel limit configured.")
     
     PARALLEL_LIMITS = {k.lower(): v for k, v in parallel_limits_raw.items()}
     MODEL_SEMAPHORES = {}
     for model_name, limit in PARALLEL_LIMITS.items():
         if isinstance(limit, int) and limit > 0:
             MODEL_SEMAPHORES[model_name] = asyncio.Semaphore(limit)
-            print(f"Parallel limit: model '{model_name}' limited to {limit} concurrent request(s)")
+            logger.info(f"Parallel limit: model '{model_name}' limited to {limit} concurrent request(s)")
         else:
-            print(f"WARNING: Invalid parallel limit for model '{model_name}': {limit}. Must be a positive integer. Skipping.")
+            logger.warning(f"Invalid parallel limit for model '{model_name}': {limit}. Must be a positive integer. Skipping.")
     if not PARALLEL_LIMITS:
-        print("No per-model parallel request limits configured.")
+        logger.info("No per-model parallel request limits configured.")
 
     # Initialize throttle manager
     throttle_manager = None
     if THROTTLE_CONFIG.get("enabled"):
         try:
             throttle_manager = ThrottleManager(THROTTLE_CONFIG, ENABLE_DEBUG_LOGS, 0)
-            print(f"Throttle manager initialized: enabled={throttle_manager.enabled}")
+            logger.info(f"Throttle manager initialized: enabled={throttle_manager.enabled}")
         except ValueError as e:
-            print(f"ERROR: Invalid throttle configuration: {e}")
+            logger.error(f"Invalid throttle configuration: {e}")
             raise
 
-    print(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
-    print(f"Proxying requests to upstream server at {TARGET_BASE_URL}")
-    print(f"Server capabilities: OpenAI={SERVER_SUPPORTS_OPENAI}, Anthropic={SERVER_SUPPORTS_ANTHROPIC}")
-    print(f"Debug logs are {'ENABLED' if ENABLE_DEBUG_LOGS else 'DISABLED'}.")
-    print(f"Override logs are {'ENABLED' if ENABLE_OVERRIDE_LOGS else 'DISABLED'}.")
-    print(f"Validation logs are {'ENABLED' if ENABLE_VALIDATION_LOGS else 'DISABLED'}.")
+    logger.info(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
+    logger.info(f"Proxying requests to upstream server at {TARGET_BASE_URL}")
+    logger.info(f"Server capabilities: OpenAI={SERVER_SUPPORTS_OPENAI}, Anthropic={SERVER_SUPPORTS_ANTHROPIC}")
+    logger.info(f"Debug logs are {'ENABLED' if ENABLE_DEBUG_LOGS else 'DISABLED'}.")
+    logger.info(f"Override logs are {'ENABLED' if ENABLE_OVERRIDE_LOGS else 'DISABLED'}.")
+    logger.info(f"Validation logs are {'ENABLED' if ENABLE_VALIDATION_LOGS else 'DISABLED'}.")
     uvicorn.run(app, host=SAMPLING_PROXY_HOST, port=SAMPLING_PROXY_PORT)

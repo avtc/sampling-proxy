@@ -1,5 +1,8 @@
 import asyncio
+import logging
 from typing import Optional, Dict
+
+logger = logging.getLogger("sampling_proxy.throttle")
 
 class ModelThrottle:
     """Holds throttle state for a single model."""
@@ -52,12 +55,12 @@ class ThrottleManager:
         """Log debug message if enabled."""
         if self.enable_debug_logs:
             rid = request_id if request_id is not None else self.request_id
-            print(f"[DEBUG][R:{rid}] Throttle: {message}")
+            logger.debug(f"[R:{rid}] Throttle: {message}")
 
     def _log_info(self, message: str, request_id: int = None):
         """Log info message."""
         rid = request_id if request_id is not None else self.request_id
-        print(f"[INFO][R:{rid}] Throttle: {message}")
+        logger.info(f"[R:{rid}] Throttle: {message}")
 
     # Sentinel indicating "not specified in config" (distinct from None which means "disabled")
     _UNSET = object()
