@@ -1198,6 +1198,16 @@ async def proxy_target_requests(path: str, request: Request):
                     if ENABLE_OVERRIDE_LOGS:
                         logger.info(f"OVERRIDE: Non-Anthropic model '{original_model_name}' OVERRIDDEN to '{OVERRIDE_MODEL_NAME}'")
 
+            # Normalize message roles: convert 'developer' to 'system' for local servers
+            # that don't recognize the newer OpenAI 'developer' role (e.g. vLLM, SGLang)
+            messages = incoming_json_body.get("messages")
+            if isinstance(messages, list):
+                for msg in messages:
+                    if isinstance(msg, dict) and msg.get("role") == "developer":
+                        msg["role"] = "system"
+                        if ENABLE_DEBUG_LOGS:
+                            logger.debug("Converted message role 'developer' -> 'system'")
+
             # Determine where sampling parameters are expected in the request body
             # For /generate, they are typically in a 'sampling_params' sub-dictionary
             # For OpenAI-compatible endpoints, they are typically top-level keys
