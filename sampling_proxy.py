@@ -1304,6 +1304,35 @@ async def proxy_target_requests(path: str, request: Request):
             used = limit - model_semaphore._value
             log_info(request_id, f"Slot acquired {model_name}, used: {used}/{limit}")
 
+    # Helper to release semaphores after streaming completes
+    semaphores_released = False
+
+    async def release_semaphores():
+        nonlocal semaphores_released
+        if semaphores_released:
+            return
+        semaphores_released = True
+        # Release in reverse order of acquisition (model first, then global)
+        if model_semaphore is not None:
+            model_semaphore.release()
+            limit = PARALLEL_LIMITS.get(model_name.lower())
+            used = limit - model_semaphore._value
+            log_info(request_id, f"Slot released {model_name}, used: {used}/{limit}")
+        if global_semaphore is not None:
+            global_semaphore.release()
+            used = GLOBAL_LIMIT - global_semaphore._value
+            log_info(request_id, f"Global slot released, used: {used}/{GLOBAL_LIMIT}")
+
+    def wrap_stream_with_semaphore_release(generator):
+        """Wrap an async generator to release semaphores when streaming completes."""
+        async def wrapped():
+            try:
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                await release_semaphores()
+        return wrapped()
+
     # --- Forward Request and Handle Response ---
     try:
         if is_generation_request and request.method == "POST":
@@ -1568,7 +1597,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 return
 
                     return _StatusStreamingResponse(
-                        buffered_stream_with_validation(),
+                        wrap_stream_with_semaphore_release(buffered_stream_with_validation()),
                         status_holder=stream_status_holder,
                         status_code=target_response.status_code,
                         headers=response_headers,
@@ -1779,7 +1808,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 return
 
                     return _StatusStreamingResponse(
-                        buffered_openai_stream_with_validation(),
+                        wrap_stream_with_semaphore_release(buffered_openai_stream_with_validation()),
                         status_holder=openai_convert_status_holder,
                         status_code=target_response.status_code,
                         headers=response_headers,
@@ -1979,7 +2008,7 @@ async def proxy_target_requests(path: str, request: Request):
                                 return
 
                     return _StatusStreamingResponse(
-                        buffered_openai_passthrough_stream_with_validation(),
+                        wrap_stream_with_semaphore_release(buffered_openai_passthrough_stream_with_validation()),
                         status_holder=openai_passthrough_status_holder,
                         status_code=target_response.status_code,
                         headers=response_headers,
@@ -2112,7 +2141,7 @@ async def proxy_target_requests(path: str, request: Request):
                         await target_response.aclose()
 
                 return StreamingResponse(
-                    stream_and_close_response(), # Use the local async generator
+                    wrap_stream_with_semaphore_release(stream_and_close_response()), # Use the local async generator
                     status_code=target_response.status_code,
                     headers=response_headers,
                     media_type=response_headers.get("content-type"),
@@ -2353,16 +2382,11 @@ async def proxy_target_requests(path: str, request: Request):
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     finally:
         # --- Parallel Limit Semaphore Release ---
-        # Release semaphores in reverse order of acquisition (model first, then global)
-        if model_semaphore is not None:
-            model_semaphore.release()
-            limit = PARALLEL_LIMITS.get(model_name.lower())
-            used = limit - model_semaphore._value
-            log_info(request_id, f"Slot released {model_name}, used: {used}/{limit}")
-        if global_semaphore is not None:
-            global_semaphore.release()
-            used = GLOBAL_LIMIT - global_semaphore._value
-            log_info(request_id, f"Global slot released, used: {used}/{GLOBAL_LIMIT}")
+        # For non-streaming responses, release semaphores here.
+        # For streaming responses, semaphores are released by wrap_stream_with_semaphore_release()
+        # when the stream completes.
+        if not semaphores_released:
+            await release_semaphores()
 
         # --- Throttle After Send (generation requests only) ---
         if throttle_manager and is_generation_request and request.method == "POST":
