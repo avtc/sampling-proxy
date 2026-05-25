@@ -1223,7 +1223,23 @@ async def proxy_target_requests(path: str, request: Request):
                         if ENABLE_OVERRIDE_LOGS:
                             print(f"OVERRIDE: '{param}' from '{original_value}' to '{override_value}'")
 
-            # Then, apply default parameters for any missing parameters not overridden
+            # Then, apply model-specific default parameters (same logic as default_sampling_params, but per-model)
+            if model_specific_params:
+                for param, model_default_value in model_specific_params.items():
+                    if param not in current_params_container:
+                        # Skip if this parameter is being overridden (already handled above)
+                        if OVERRIDE_SAMPLING_PARAMS and param in OVERRIDE_SAMPLING_PARAMS:
+                            if ENABLE_DEBUG_LOGS:
+                                print(f"DEBUG: Parameter '{param}' is overridden, skipping model-specific default application.")
+                            continue
+                        current_params_container[param] = model_default_value
+                        if ENABLE_OVERRIDE_LOGS:
+                            print(f"DEBUG: [model:{model_name}] Overriding '{param}' to '{model_default_value}' (was not in request).")
+                    else:
+                        if ENABLE_OVERRIDE_LOGS:
+                            print(f"DEBUG: [model:{model_name}] Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
+
+            # Then, apply global default parameters for any missing parameters not covered by model-specific or overrides
             for param, default_value in DEFAULT_SAMPLING_PARAMS.items():
                 if param not in current_params_container:
                     # Skip if this parameter is being overridden (already handled above)
@@ -1231,13 +1247,9 @@ async def proxy_target_requests(path: str, request: Request):
                         if ENABLE_DEBUG_LOGS:
                             print(f"DEBUG: Parameter '{param}' is overridden, skipping default application.")
                         continue
-                    
-                    # If the parameter is missing from the incoming request,
-                    # try to get it from model-specific settings, otherwise use the global default.
-                    value_to_apply = model_specific_params.get(param, default_value)
-                    current_params_container[param] = value_to_apply
+                    current_params_container[param] = default_value
                     if ENABLE_OVERRIDE_LOGS:
-                        print(f"DEBUG: Overriding '{param}' to '{value_to_apply}' (was not in request).")
+                        print(f"DEBUG: Overriding '{param}' to '{default_value}' (was not in request).")
                 else:
                     if ENABLE_OVERRIDE_LOGS:
                         print(f"DEBUG: Parameter '{param}' already present in request: {current_params_container[param]}. Not overriding.")
