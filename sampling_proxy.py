@@ -1077,8 +1077,8 @@ async def proxy_target_requests(path: str, request: Request):
             logger.debug(f"Relative path for httpx: {relative_path}")
 
         target_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
-    if ENABLE_DEBUG_LOGS:
-        logger.debug(f"Target upstream URL: {target_url}")
+        if ENABLE_DEBUG_LOGS:
+            logger.debug(f"Target upstream URL: {target_url}")
 
     # --- Sampling Parameter Override Logic ---
     if is_generation_request and request.method == "POST":
