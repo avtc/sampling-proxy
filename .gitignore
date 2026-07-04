@@ -64,3 +64,6 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+# feature-flow artifact junction (external storage)
+.ff

@@ -5,6 +5,7 @@ A middleware server for OpenAI-compatible backends with passthrough (OpenAI/Anth
 ## Features
 
 - **Passthrough Modes**: OpenAI, Anthropic, and Anthropic-to-OpenAI conversion
+- **Multiple Upstream Servers**: Route different models to different backends with glob pattern matching
 - **Parameter Override**: Apply custom sampling parameters per model
 - **Parallel Request Limits**: Limit concurrent requests per model with automatic queueing
 - **Request Throttling:** Configurable cooldown delays between requests per model
@@ -59,7 +60,8 @@ python sampling_proxy.py --help
 | `--config, -c` | Path to config JSON file |
 | `--host` | Proxy server host |
 | `--port` | Proxy server port |
-| `--target-base-url` | Backend URL |
+| `--target-base-url` | Backend URL (repeatable, use `name=url` to target specific upstream) |
+| `--model-bindings` | Model-to-upstream bindings as JSON string |
 | `--debug-logs, -d` | Enable debug logging |
 | `--enforce-params, -e` | Enforce parameters as JSON |
 
@@ -160,7 +162,67 @@ Per-model settings override global. Both timers default to `null` (disabled).
 | `/chat/completions` | OpenAI chat completions |
 | `/messages` | Anthropic messages (converted) |
 | `/models` | List available models |
-| `/` | Health check |
+| `/` | Health check (shows upstreams and bindings) |
+
+## Multiple Upstream Servers
+
+Route different models to different backend servers. Each upstream has its own URL, timeout, and format support.
+
+### Configuration
+
+```json
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 8001,
+    "base_path": ""
+  },
+  "upstreams": [
+    {
+      "name": "local-openai",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "connect_timeout_seconds": 5.0,
+      "timeout_seconds": 1200.0,
+      "supports_openai": true,
+      "supports_anthropic": false
+    },
+    {
+      "name": "zai-anthropic",
+      "base_url": "https://api.z.ai/api/anthropic",
+      "connect_timeout_seconds": 5.0,
+      "timeout_seconds": 1200.0,
+      "supports_openai": false,
+      "supports_anthropic": true
+    }
+  ],
+  "model_upstream_binding": {
+    "glm-*": "zai-anthropic",
+    "*": "local-openai"
+  }
+}
+```
+
+### Model Binding Rules
+
+- **Exact match** takes priority: `"glm-5": "zai-anthropic"`
+- **Glob patterns** via `fnmatch`: `"glm-*": "zai-anthropic"` matches `glm-4.7`, `glm-5-Turbo`, etc.
+- **Wildcard** `"*"` catches everything not matched above
+- Patterns are evaluated in config order — first match wins
+- If no pattern matches, the proxy returns a `400` error
+
+### Legacy Single-Upstream Config
+
+The old `server.target_base_url` format still works — it auto-wraps as a single upstream:
+
+```json
+{
+  "server": {
+    "target_base_url": "http://127.0.0.1:8000",
+    "supports_openai": true,
+    "supports_anthropic": false
+  }
+}
+```
 
 ## License
 

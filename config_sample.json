@@ -1,13 +1,30 @@
 {
-  "server": {
-    "target_base_url": "http://127.0.0.1:8000",
-    "sampling_proxy_base_path": "",
-    "sampling_proxy_host": "0.0.0.0",
-    "sampling_proxy_port": 8001,
-    "connect_timeout_seconds": 5.0,
-    "timeout_seconds": 1200.0,
-    "supports_openai": true,
-    "supports_anthropic": true
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 8001,
+    "base_path": ""
+  },
+  "upstreams": [
+    {
+      "name": "local-openai",
+      "base_url": "http://127.0.0.1:8000",
+      "connect_timeout_seconds": 5.0,
+      "timeout_seconds": 1200.0,
+      "supports_openai": true,
+      "supports_anthropic": false
+    },
+    {
+      "name": "zai-anthropic",
+      "base_url": "https://api.z.ai/api/anthropic",
+      "connect_timeout_seconds": 5.0,
+      "timeout_seconds": 1200.0,
+      "supports_openai": false,
+      "supports_anthropic": true
+    }
+  ],
+  "model_upstream_binding": {
+    "glm-*": "zai-anthropic",
+    "*": "local-openai"
   },
   "logging": {
     "enable_debug_logs": false,

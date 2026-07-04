@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import httpx
+import fnmatch
 from typing import Optional
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -64,16 +65,13 @@ def load_config(config_path="config.json"):
     If config file doesn't exist or is invalid, returns default values.
     """
     default_config = {
-        "server": {
-            "target_base_url": "http://127.0.0.1:8000/v1",
-            "sampling_proxy_base_path": "",
-            "sampling_proxy_host": "0.0.0.0",
-            "sampling_proxy_port": 8001,
-            "connect_timeout_seconds": 5.0,
-            "timeout_seconds": 1200.0,
-            "supports_openai": True,
-            "supports_anthropic": False
+        "listen": {
+            "host": "0.0.0.0",
+            "port": 8001,
+            "base_path": ""
         },
+        "upstreams": [],
+        "model_upstream_binding": {},
         "logging": {
             "enable_debug_logs": False,
             "enable_override_logs": False
@@ -128,6 +126,41 @@ def load_config(config_path="config.json"):
                     merged_config[key] = value
             else:
                 merged_config[key] = value
+        
+        # --- Backward compat: convert legacy 'server' block to 'upstreams' ---
+        # If 'upstreams' is empty/absent but 'server.target_base_url' exists, wrap as single upstream
+        if not merged_config.get("upstreams") and "server" in config:
+            server_cfg = config["server"]
+            base_url = server_cfg.get("target_base_url", "http://127.0.0.1:8000/v1")
+            merged_config["upstreams"] = [{
+                "name": "default",
+                "base_url": base_url,
+                "connect_timeout_seconds": server_cfg.get("connect_timeout_seconds", 5.0),
+                "timeout_seconds": server_cfg.get("timeout_seconds", 1200.0),
+                "supports_openai": server_cfg.get("supports_openai", True),
+                "supports_anthropic": server_cfg.get("supports_anthropic", False),
+            }]
+            # Migrate proxy listen config from server block
+            listen_cfg = merged_config.setdefault("listen", {})
+            if not listen_cfg.get("host"):
+                listen_cfg["host"] = server_cfg.get("sampling_proxy_host", "0.0.0.0")
+            if not listen_cfg.get("port"):
+                listen_cfg["port"] = server_cfg.get("sampling_proxy_port", 8001)
+            if not listen_cfg.get("base_path"):
+                listen_cfg["base_path"] = server_cfg.get("sampling_proxy_base_path", "")
+            logger.info("Legacy 'server' block detected — wrapped as single upstream named 'default'")
+        
+        # If 'model_upstream_binding' is absent and upstreams exist with a single entry,
+        # auto-bind everything to that upstream
+        if not merged_config.get("model_upstream_binding") and merged_config.get("upstreams"):
+            upstreams = merged_config["upstreams"]
+            if len(upstreams) == 1:
+                merged_config["model_upstream_binding"] = {"*": upstreams[0]["name"]}
+                logger.info("Single upstream detected — auto-bound all models via wildcard '*'")
+        
+        # Validate: at least one upstream required
+        if not merged_config.get("upstreams"):
+            logger.warning("No upstream servers configured. Requests cannot be proxied.")
         
         # Filter out null values from sampling params (convert to empty dicts)
         if merged_config.get("default_sampling_params"):
@@ -204,8 +237,6 @@ def transform_path(original_path, from_base_path, to_base_path):
 
 # --- Configuration ---
 # These will be initialized in the main block after loading config
-TARGET_BASE_URL = None
-TARGET_BASE_PATH = None
 SAMPLING_PROXY_HOST = None
 SAMPLING_PROXY_PORT = None
 SAMPLING_PROXY_BASE_PATH = None
@@ -219,8 +250,15 @@ OVERRIDE_MODEL_NAME = None
 OVERRIDE_SAMPLING_PARAMS = {}
 MODEL_SAMPLING_PARAMS = {}
 
-# Server capability configuration
-# Determines what formats the backend server supports for passthrough
+# Upstream server pool: name -> {name, base_url, base_path, supports_openai, supports_anthropic}
+UPSTREAM_CONFIGS: dict = {}
+# Per-upstream httpx clients: name -> httpx.AsyncClient
+UPSTREAM_CLIENTS: dict = {}
+# Model-to-upstream binding: pattern -> upstream_name (supports glob patterns)
+MODEL_UPSTREAM_BINDING: dict = {}
+
+# Server capability configuration — DEPRECATED, kept for backward compat within handler
+# Replaced by per-upstream lookups
 SERVER_SUPPORTS_OPENAI = True
 SERVER_SUPPORTS_ANTHROPIC = False
 VALIDATION_CONFIG = {"enabled": False}
@@ -255,11 +293,38 @@ ANTHROPIC_ENDPOINTS = [
 # Global variable to store the first available model name from /models to be used for anthropic requests
 FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
 
-# Initialize an httpx AsyncClient for making requests to the upstream server.
-# This client is designed for efficient connection pooling.
-# A higher timeout is set to accommodate potentially long LLM generation times.
-# Note: This will be re-initialized after config loading in the main block
-client = None
+def resolve_upstream_for_model(model_name: str) -> Optional[str]:
+    """Resolve which upstream a model should route to.
+    
+    Lookup order:
+    1. Exact match in model_upstream_binding
+    2. First matching glob pattern (fnmatch) in config order
+    3. None if no match
+    """
+    if not model_name:
+        return None
+    
+    # Exact match first
+    if model_name in MODEL_UPSTREAM_BINDING:
+        return MODEL_UPSTREAM_BINDING[model_name]
+    
+    # Then glob patterns (in config order, first match wins)
+    for pattern, upstream_name in MODEL_UPSTREAM_BINDING.items():
+        if '*' in pattern or '?' in pattern or '[' in pattern:
+            if fnmatch.fnmatch(model_name, pattern):
+                return upstream_name
+    
+    return None
+
+
+def get_upstream_config(upstream_name: str) -> Optional[dict]:
+    """Get upstream config by name. Returns None if not found."""
+    return UPSTREAM_CONFIGS.get(upstream_name)
+
+
+def get_upstream_client(upstream_name: str) -> Optional[httpx.AsyncClient]:
+    """Get httpx client for an upstream by name. Returns None if not found."""
+    return UPSTREAM_CLIENTS.get(upstream_name)
 
 def get_model_semaphore(model_name: str):
     """Get the semaphore for a model if a parallel limit is configured. Returns None if no limit."""
@@ -281,60 +346,68 @@ def get_global_semaphore():
 async def lifespan(app: FastAPI):
     """
     Handles startup and shutdown events for the FastAPI application.
-    Ensures the httpx client is properly closed when the application shuts down.
+    Ensures the httpx clients are properly closed when the application shuts down.
     """
-    global FIRST_AVAILABLE_MODEL, client
+    global FIRST_AVAILABLE_MODEL
     logger.info("FastAPI application startup.")
 
-    # Initialize client with the correct TARGET_BASE_URL and timeout from config
-    connect_timeout = CONFIG["server"].get("connect_timeout_seconds", 5.0)
-    read_timeout = CONFIG["server"].get("timeout_seconds", 1200.0)
-    timeout = httpx.Timeout(connect=connect_timeout, read=read_timeout, write=read_timeout, pool=connect_timeout)
-    client = httpx.AsyncClient(base_url=TARGET_BASE_URL, timeout=timeout)
+    # Initialize per-upstream clients
+    for name, upstream_cfg in UPSTREAM_CONFIGS.items():
+        connect_timeout = upstream_cfg.get("connect_timeout_seconds", 5.0)
+        read_timeout = upstream_cfg.get("timeout_seconds", 1200.0)
+        timeout = httpx.Timeout(connect=connect_timeout, read=read_timeout, write=read_timeout, pool=connect_timeout)
+        client = httpx.AsyncClient(base_url=upstream_cfg["base_url"], timeout=timeout)
+        UPSTREAM_CLIENTS[name] = client
+        logger.info(f"Initialized upstream client '{name}': {upstream_cfg['base_url']}")
     
-    # Validate server capabilities - at least one format must be supported
-    if not SERVER_SUPPORTS_OPENAI and not SERVER_SUPPORTS_ANTHROPIC:
+    # Validate: at least one upstream must support some format
+    has_any_capability = any(
+        cfg.get("supports_openai") or cfg.get("supports_anthropic")
+        for cfg in UPSTREAM_CONFIGS.values()
+    )
+    if not has_any_capability:
         raise ValueError(
-            "Invalid configuration: server must support at least one format. "
-            "Set 'supports_openai: true' and/or 'supports_anthropic: true' in config."
+            "Invalid configuration: at least one upstream must support OpenAI or Anthropic format."
         )
 
-    # Poll /models to get the first available model (only if server supports OpenAI and no override model set)
-    # Skip polling if: 1) server doesn't support OpenAI (/models is OpenAI-only), or 2) override model already configured
-    if SERVER_SUPPORTS_OPENAI and not OVERRIDE_MODEL_NAME:
-        # If target base path is empty, use /v1/models for standard OpenAI/Anthropic servers
-        # Otherwise, the base path already includes the prefix
-        if not TARGET_BASE_PATH:
-            models_path = "/v1/models"
-        else:
-            models_path = "/models"
-
-        try:
-            logger.info(f"Polling {TARGET_BASE_URL}{models_path} to get available models...")
-            response = await client.get(models_path)
-            if response.status_code == 200:
-                models_data = response.json()
-                if "data" in models_data and len(models_data["data"]) > 0:
-                    FIRST_AVAILABLE_MODEL = models_data["data"][0]["id"]
-                    logger.info(f"Successfully retrieved first available model: {FIRST_AVAILABLE_MODEL}")
+    # Poll /models to get the first available model from the first OpenAI-capable upstream
+    # Skip if: 1) no upstream supports OpenAI, or 2) override model already configured
+    if not OVERRIDE_MODEL_NAME:
+        openai_upstream = None
+        for name, cfg in UPSTREAM_CONFIGS.items():
+            if cfg.get("supports_openai"):
+                openai_upstream = (name, cfg)
+                break
+        
+        if openai_upstream:
+            upstream_name, upstream_cfg = openai_upstream
+            upstream_client = UPSTREAM_CLIENTS[upstream_name]
+            base_path = upstream_cfg["base_path"]
+            models_path = "/models" if base_path else "/v1/models"
+            
+            try:
+                logger.info(f"Polling {upstream_cfg['base_url']}{models_path} to get available models...")
+                response = await upstream_client.get(models_path)
+                if response.status_code == 200:
+                    models_data = response.json()
+                    if "data" in models_data and len(models_data["data"]) > 0:
+                        FIRST_AVAILABLE_MODEL = models_data["data"][0]["id"]
+                        logger.info(f"Successfully retrieved first available model: {FIRST_AVAILABLE_MODEL}")
+                    else:
+                        logger.warning("No models found in /models response")
                 else:
-                    logger.warning("No models found in /models response")
-            else:
-                logger.warning(f"Failed to get models from {models_path}. Status: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"Error polling {models_path}: {e}")
+                    logger.warning(f"Failed to get models from {models_path}. Status: {response.status_code}")
+            except Exception as e:
+                logger.warning(f"Error polling {models_path}: {e}")
     elif OVERRIDE_MODEL_NAME:
-        # Use the override model name as the first available model
         FIRST_AVAILABLE_MODEL = OVERRIDE_MODEL_NAME
         logger.info(f"Using override model name: {FIRST_AVAILABLE_MODEL}")
-    else:
-        logger.info("Skipping model polling (server doesn't support OpenAI format)")
     
     yield # Application starts here
     logger.info("FastAPI application shutdown.")
-    if client:
+    for name, client in UPSTREAM_CLIENTS.items():
         await client.aclose()
-        logger.info("HTTPX client closed.")
+        logger.info(f"Upstream client '{name}' closed.")
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
@@ -349,9 +422,18 @@ async def read_root():
     """
     Root endpoint for a basic health check and to display middleware configuration.
     """
+    upstreams_info = []
+    for name, cfg in UPSTREAM_CONFIGS.items():
+        upstreams_info.append({
+            "name": name,
+            "base_url": cfg["base_url"],
+            "supports_openai": cfg.get("supports_openai"),
+            "supports_anthropic": cfg.get("supports_anthropic"),
+        })
     return {
         "message": "Sampling Proxy is running.",
-        "target_backend": TARGET_BASE_URL,
+        "upstreams": upstreams_info,
+        "model_upstream_binding": MODEL_UPSTREAM_BINDING,
         "sampling_proxy_port": SAMPLING_PROXY_PORT,
         "default_sampling_params": DEFAULT_SAMPLING_PARAMS,
         "override": OVERRIDE_CONFIG,
@@ -684,20 +766,55 @@ async def proxy_target_requests(path: str, request: Request):
 
     # Handle Anthropic-specific endpoints
     if path in ANTHROPIC_ENDPOINTS:
-        if SERVER_SUPPORTS_ANTHROPIC:
+        # Determine which upstream to use:
+        # - count_tokens: extract model from body, resolve by model binding
+        # - event_logging: no model field, use first Anthropic-capable upstream
+        au_name = None
+        au_model = None
+
+        if path == "v1/messages/count_tokens":
+            try:
+                raw = await request.body()
+                body_json = json.loads(raw)
+                au_model = body_json.get("model")
+                if au_model:
+                    au_name = resolve_upstream_for_model(au_model)
+            except (json.JSONDecodeError, Exception):
+                pass
+            if au_name is None:
+                # Fall back to first Anthropic-capable upstream
+                for uname, ucfg in UPSTREAM_CONFIGS.items():
+                    if ucfg.get("supports_anthropic"):
+                        au_name = uname
+                        break
+
+            # Re-read body (await request.body() caches, so it's fine)
+        else:
+            # event_logging — no model to route by
+            for uname, ucfg in UPSTREAM_CONFIGS.items():
+                if ucfg.get("supports_anthropic"):
+                    au_name = uname
+                    break
+
+        if au_name:
+            au_cfg = UPSTREAM_CONFIGS[au_name]
+            au_client = UPSTREAM_CLIENTS[au_name]
+            au_base_path = au_cfg["base_path"]
+
             # In Anthropic passthrough mode, proxy these endpoints upstream as-is
             if ENABLE_DEBUG_LOGS:
-                logger.debug(f"Passthrough Anthropic endpoint '{path}' to upstream")
+                logger.debug(f"Passthrough Anthropic endpoint '{path}' to upstream '{au_name}'" +
+                             (f" (model: {au_model})" if au_model else ""))
 
-            target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
+            target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, au_base_path)
             passthrough_headers = dict(request.headers)
             passthrough_headers.pop("host", None)
             passthrough_headers.pop("content-length", None)
             passthrough_body = await request.body()
 
-            # Strip TARGET_BASE_PATH to avoid doubling it (httpx client has base_url set)
-            if TARGET_BASE_PATH and target_path.startswith(TARGET_BASE_PATH):
-                relative_path = target_path[len(TARGET_BASE_PATH):]
+            # Strip upstream base path to avoid doubling it (httpx client has base_url set)
+            if au_base_path and target_path.startswith(au_base_path):
+                relative_path = target_path[len(au_base_path):]
                 if relative_path and not relative_path.startswith('/'):
                     relative_path = '/' + relative_path
             else:
@@ -707,7 +824,7 @@ async def proxy_target_requests(path: str, request: Request):
             passthrough_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
 
             try:
-                upstream_response = await client.request(
+                upstream_response = await au_client.request(
                     method=request.method,
                     url=passthrough_url,
                     headers=passthrough_headers,
@@ -850,6 +967,7 @@ async def proxy_target_requests(path: str, request: Request):
     is_generation_request = False
     is_anthropic_request = False # Initialize Anthropic request flag
     incoming_json_body = {} # Initialize in case it's not a POST/JSON request
+    model_name = None  # Model name extracted from request
 
     # Determine if the current request path is a recognized generation endpoint
     # Use suffix matching to handle paths with or without v1 prefix
@@ -859,60 +977,106 @@ async def proxy_target_requests(path: str, request: Request):
         logger.debug(f"is_generation_request after check: {is_generation_request}")
         logger.debug(f"is_anthropic_request: {is_anthropic_request}")
 
-    # Construct the target URL based on server capabilities
-    # Determine passthrough mode based on request format and server capabilities
-    should_passthrough_anthropic = is_anthropic_request and SERVER_SUPPORTS_ANTHROPIC
-    should_passthrough_openai = not is_anthropic_request and SERVER_SUPPORTS_OPENAI
+    # --- Upstream resolution ---
+    # For generation POST requests, we need the model name first (parsed below).
+    # For non-generation requests, resolve upstream now based on path format.
+    upstream_name = None
+    upstream_cfg = None
+    upstream_client = None
 
-    if is_anthropic_request:
-        if should_passthrough_anthropic:
-            # Keep Anthropic path as-is, no conversion
-            target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
-            if ENABLE_DEBUG_LOGS:
-                logger.debug(f"Anthropic passthrough mode - keeping path: {target_path}")
+    def _resolve_upstream_now():
+        """Resolve upstream for non-generation or non-POST requests based on path format."""
+        nonlocal upstream_name, upstream_cfg, upstream_client
+        if is_anthropic_request:
+            for uname, ucfg in UPSTREAM_CONFIGS.items():
+                if ucfg.get("supports_anthropic"):
+                    upstream_name = uname
+                    upstream_cfg = ucfg
+                    upstream_client = UPSTREAM_CLIENTS[uname]
+                    return
+        # Fall back to OpenAI-compatible, then any upstream
+        for uname, ucfg in UPSTREAM_CONFIGS.items():
+            if ucfg.get("supports_openai"):
+                upstream_name = uname
+                upstream_cfg = ucfg
+                upstream_client = UPSTREAM_CLIENTS[uname]
+                return
+        # Last resort: first upstream
+        if UPSTREAM_CONFIGS:
+            first_name = next(iter(UPSTREAM_CONFIGS))
+            upstream_name = first_name
+            upstream_cfg = UPSTREAM_CONFIGS[first_name]
+            upstream_client = UPSTREAM_CLIENTS[first_name]
+
+    if not (is_generation_request and request.method == "POST"):
+        _resolve_upstream_now()
+
+    # For generation POST requests, upstream is resolved after parsing model name (below).
+    # For now, check if we even have any upstreams for non-generation paths.
+    if not (is_generation_request and request.method == "POST") and upstream_name is None:
+        return Response(
+            content=json.dumps({"error": {"type": "api_error", "message": "No upstream servers configured"}}),
+            status_code=502,
+            media_type="application/json"
+        )
+
+    # Determine passthrough flags based on resolved upstream capabilities
+    if upstream_cfg is not None:
+        should_passthrough_anthropic = is_anthropic_request and upstream_cfg.get("supports_anthropic", False)
+        should_passthrough_openai = not is_anthropic_request and upstream_cfg.get("supports_openai", False)
+    else:
+        # Will be set after upstream resolution for generation requests
+        should_passthrough_anthropic = None
+        should_passthrough_openai = None
+
+    # Construct target path based on request format and upstream capabilities
+    # For generation POST requests, this is deferred until upstream is resolved
+    target_path = None
+    relative_path = None
+
+    if not (is_generation_request and request.method == "POST"):
+        # Non-generation path — compute target_path now
+        if is_anthropic_request:
+            if should_passthrough_anthropic:
+                target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, upstream_cfg["base_path"])
+                if ENABLE_DEBUG_LOGS:
+                    logger.debug(f"Anthropic passthrough mode - keeping path: {target_path}")
+            else:
+                transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, upstream_cfg["base_path"])
+                target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
+                if ENABLE_DEBUG_LOGS:
+                    logger.debug(f"Converting Anthropic request from {original_path} to {target_path}")
         else:
-            # Convert /v1/messages to /chat/completions for OpenAI-compatible upstream server
-            # First apply the path transformation, then change to chat completions
-            transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
-            target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
-            if ENABLE_DEBUG_LOGS:
-                logger.debug(f"Converting Anthropic request from {original_path} to {target_path}")
-    else:
-        if not SERVER_SUPPORTS_OPENAI:
-            # OpenAI request but server doesn't support OpenAI - we can't convert OpenAI to Anthropic
-            return Response(
-                content=json.dumps({
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": "Server does not support OpenAI format requests. Only Anthropic format is supported."
-                    }
-                }),
-                status_code=400,
-                media_type="application/json"
-            )
-        # Apply base path transformation
-        target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, TARGET_BASE_PATH)
-    
-    if ENABLE_DEBUG_LOGS:
-        logger.debug(f"Path transformation: /{original_path} -> {target_path}")
-        logger.debug(f"Base paths - Proxy: {SAMPLING_PROXY_BASE_PATH}, Target: {TARGET_BASE_PATH}")
-    
-    # Since httpx.AsyncClient is created with base_url=TARGET_BASE_URL,
-    # we need to provide only the path portion relative to the target base path
-    # Strip the TARGET_BASE_PATH from the beginning of target_path if it exists
-    if TARGET_BASE_PATH and target_path.startswith(TARGET_BASE_PATH):
-        relative_path = target_path[len(TARGET_BASE_PATH):]
-        # Ensure the relative path starts with / if it's not empty
-        if relative_path and not relative_path.startswith('/'):
-            relative_path = '/' + relative_path
-    else:
-        relative_path = target_path
-    
-    if ENABLE_DEBUG_LOGS:
-        logger.debug(f"Relative path for httpx: {relative_path}")
-    
-    # Ensure the query string is encoded to bytes as required by httpx.URL
-    target_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
+            if not upstream_cfg.get("supports_openai"):
+                return Response(
+                    content=json.dumps({
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": f"Upstream '{upstream_name}' does not support OpenAI format requests."
+                        }
+                    }),
+                    status_code=400,
+                    media_type="application/json"
+                )
+            target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, upstream_cfg["base_path"])
+
+        if ENABLE_DEBUG_LOGS:
+            logger.debug(f"Path transformation: /{original_path} -> {target_path}")
+            logger.debug(f"Base paths - Proxy: {SAMPLING_PROXY_BASE_PATH}, Upstream: {upstream_cfg['base_path']}")
+
+        # Compute relative path for httpx (strip upstream base_path)
+        ubp = upstream_cfg["base_path"]
+        if ubp and target_path.startswith(ubp):
+            relative_path = target_path[len(ubp):]
+            if relative_path and not relative_path.startswith('/'):
+                relative_path = '/' + relative_path
+        else:
+            relative_path = target_path
+
+        if ENABLE_DEBUG_LOGS:
+            logger.debug(f"Relative path for httpx: {relative_path}")
+
+        target_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
     if ENABLE_DEBUG_LOGS:
         logger.debug(f"Target upstream URL: {target_url}")
 
@@ -929,6 +1093,79 @@ async def proxy_target_requests(path: str, request: Request):
             incoming_json_body = json.loads(raw_body) # This will be available for response processing
             if ENABLE_DEBUG_LOGS:
                 logger.debug(f"Parsed incoming JSON body: {incoming_json_body}")
+
+            # --- Resolve upstream based on model name ---
+            _raw_model = incoming_json_body.get("model")
+            if _raw_model:
+                _resolved = resolve_upstream_for_model(_raw_model)
+                if _resolved:
+                    upstream_name = _resolved
+                    upstream_cfg = UPSTREAM_CONFIGS[_resolved]
+                    upstream_client = UPSTREAM_CLIENTS[_resolved]
+                    if ENABLE_DEBUG_LOGS:
+                        logger.debug(f"Resolved model '{_raw_model}' -> upstream '{_resolved}'")
+                else:
+                    # No binding found — error
+                    return Response(
+                        content=json.dumps({
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": f"No upstream binding for model '{_raw_model}'"
+                            }
+                        }),
+                        status_code=400,
+                        media_type="application/json"
+                    )
+            else:
+                # No model in request — fall back to first compatible upstream
+                _resolve_upstream_now()
+
+            # Now set passthrough flags from resolved upstream
+            should_passthrough_anthropic = is_anthropic_request and upstream_cfg.get("supports_anthropic", False)
+            should_passthrough_openai = not is_anthropic_request and upstream_cfg.get("supports_openai", False)
+
+            # Compute target path and URL from resolved upstream
+            ubp = upstream_cfg["base_path"]
+            if is_anthropic_request:
+                if should_passthrough_anthropic:
+                    target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, ubp)
+                    if ENABLE_DEBUG_LOGS:
+                        logger.debug(f"Anthropic passthrough mode - keeping path: {target_path}")
+                else:
+                    transformed_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, ubp)
+                    target_path = transformed_path.replace("/v1/messages", "/chat/completions", 1)
+                    if ENABLE_DEBUG_LOGS:
+                        logger.debug(f"Converting Anthropic request from {original_path} to {target_path}")
+            else:
+                if not should_passthrough_openai:
+                    return Response(
+                        content=json.dumps({
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": f"Upstream '{upstream_name}' does not support OpenAI format requests."
+                            }
+                        }),
+                        status_code=400,
+                        media_type="application/json"
+                    )
+                target_path = transform_path("/" + original_path, SAMPLING_PROXY_BASE_PATH, ubp)
+
+            if ENABLE_DEBUG_LOGS:
+                logger.debug(f"Path transformation: /{original_path} -> {target_path}")
+                logger.debug(f"Base paths - Proxy: {SAMPLING_PROXY_BASE_PATH}, Upstream '{upstream_name}': {ubp}")
+
+            # Compute relative path for httpx (strip upstream base_path)
+            if ubp and target_path.startswith(ubp):
+                relative_path = target_path[len(ubp):]
+                if relative_path and not relative_path.startswith('/'):
+                    relative_path = '/' + relative_path
+            else:
+                relative_path = target_path
+
+            target_url = httpx.URL(path=relative_path, query=request.url.query.encode("utf-8"))
+            if ENABLE_DEBUG_LOGS:
+                logger.debug(f"Relative path for httpx: {relative_path}")
+                logger.debug(f"Target upstream URL: {target_url}")
 
             # Handle Anthropic request based on server capabilities
             if is_anthropic_request:
@@ -1371,7 +1608,7 @@ async def proxy_target_requests(path: str, request: Request):
 
             if is_streaming_request:
                 # For streaming requests, use streaming
-                target_request_obj = client.build_request(
+                target_request_obj = upstream_client.build_request(
                     method=request.method,
                     url=target_url,
                     headers=headers,
@@ -1381,12 +1618,12 @@ async def proxy_target_requests(path: str, request: Request):
                 # Send the request and get the raw response object, enabling streaming
                 if throttle_manager:
                     await throttle_manager.wait_before_send(model_name, request_id)
-                target_response = await client.send(target_request_obj, stream=True)
+                target_response = await upstream_client.send(target_request_obj, stream=True)
             else:
                 # For non-streaming requests, fetch the full response
                 if throttle_manager:
                     await throttle_manager.wait_before_send(model_name, request_id)
-                target_response = await client.request(
+                target_response = await upstream_client.request(
                     method=request.method,
                     url=target_url,
                     headers=headers,
@@ -1526,14 +1763,14 @@ async def proxy_target_requests(path: str, request: Request):
                                 # Use streaming for retry (same as initial request)
                                 if throttle_manager:
                                     await throttle_manager.wait_before_send(model_name, request_id)
-                                retry_request_obj = client.build_request(
+                                retry_request_obj = upstream_client.build_request(
                                     method=request.method,
                                     url=target_url,
                                     headers=headers,
                                     params=request.query_params,
                                     content=request_content,
                                 )
-                                retry_response = await client.send(retry_request_obj, stream=True)
+                                retry_response = await upstream_client.send(retry_request_obj, stream=True)
                                 if retry_response.status_code == 200:
                                     log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                     current_response = retry_response
@@ -1588,13 +1825,13 @@ async def proxy_target_requests(path: str, request: Request):
                                     # Use streaming for retry (same as initial request)
                                     if throttle_manager:
                                         await throttle_manager.wait_before_send(model_name, request_id)
-                                    retry_request_obj = client.build_request(
+                                    retry_request_obj = upstream_client.build_request(
                                         method="POST",
                                         url=target_url,
                                         headers=headers,
                                         content=request_content,
                                     )
-                                    retry_response = await client.send(retry_request_obj, stream=True)
+                                    retry_response = await upstream_client.send(retry_request_obj, stream=True)
                                     if retry_response.status_code == 200:
                                         log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                         current_response = retry_response
@@ -1727,14 +1964,14 @@ async def proxy_target_requests(path: str, request: Request):
                                 # Use streaming for retry (same as initial request)
                                 if throttle_manager:
                                     await throttle_manager.wait_before_send(model_name, request_id)
-                                retry_request_obj = client.build_request(
+                                retry_request_obj = upstream_client.build_request(
                                     method=request.method,
                                     url=target_url,
                                     headers=headers,
                                     params=request.query_params,
                                     content=request_content,
                                 )
-                                retry_response = await client.send(retry_request_obj, stream=True)
+                                retry_response = await upstream_client.send(retry_request_obj, stream=True)
                                 if retry_response.status_code == 200:
                                     log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                     current_response = retry_response
@@ -1797,13 +2034,13 @@ async def proxy_target_requests(path: str, request: Request):
                                     # Use streaming for retry (same as initial request)
                                     if throttle_manager:
                                         await throttle_manager.wait_before_send(model_name, request_id)
-                                    retry_request_obj = client.build_request(
+                                    retry_request_obj = upstream_client.build_request(
                                         method="POST",
                                         url=target_url,
                                         headers=headers,
                                         content=request_content,
                                     )
-                                    retry_response = await client.send(retry_request_obj, stream=True)
+                                    retry_response = await upstream_client.send(retry_request_obj, stream=True)
                                     if retry_response.status_code == 200:
                                         log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                         current_response = retry_response
@@ -1935,14 +2172,14 @@ async def proxy_target_requests(path: str, request: Request):
                                 # Use streaming for retry (same as initial request)
                                 if throttle_manager:
                                     await throttle_manager.wait_before_send(model_name, request_id)
-                                retry_request_obj = client.build_request(
+                                retry_request_obj = upstream_client.build_request(
                                     method=request.method,
                                     url=target_url,
                                     headers=headers,
                                     params=request.query_params,
                                     content=request_content,
                                 )
-                                retry_response = await client.send(retry_request_obj, stream=True)
+                                retry_response = await upstream_client.send(retry_request_obj, stream=True)
                                 if retry_response.status_code == 200:
                                     log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                     current_response = retry_response
@@ -1999,13 +2236,13 @@ async def proxy_target_requests(path: str, request: Request):
                                     # Use streaming for retry (same as initial request)
                                     if throttle_manager:
                                         await throttle_manager.wait_before_send(model_name, request_id)
-                                    retry_request_obj = client.build_request(
+                                    retry_request_obj = upstream_client.build_request(
                                         method="POST",
                                         url=target_url,
                                         headers=headers,
                                         content=request_content,
                                     )
-                                    retry_response = await client.send(retry_request_obj, stream=True)
+                                    retry_response = await upstream_client.send(retry_request_obj, stream=True)
                                     if retry_response.status_code == 200:
                                         log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                                         current_response = retry_response
@@ -2321,7 +2558,7 @@ async def proxy_target_requests(path: str, request: Request):
                         log_info(request_id, f"Retry attempt {attempt}/{max_attempts}")
                         if throttle_manager:
                             await throttle_manager.wait_before_send(model_name, request_id)
-                        retry_response = await client.request(
+                        retry_response = await upstream_client.request(
                             method="POST",
                             url=target_url,
                             headers=headers,
@@ -2358,7 +2595,7 @@ async def proxy_target_requests(path: str, request: Request):
             if ENABLE_DEBUG_LOGS:
                 logger.debug("Sending non-generation request to upstream server.")
             # For all other requests (e.g., GET /models), fetch the full response
-            target_response = await client.request(
+            target_response = await upstream_client.request(
                 method=request.method,
                 url=target_url, # Use original_path for the actual request
                 headers=headers,
@@ -2391,8 +2628,9 @@ async def proxy_target_requests(path: str, request: Request):
             )
 
     except httpx.ConnectError as e:
+        upstream_url = upstream_cfg["base_url"] if upstream_cfg else "unknown"
         logger.error(f"[{request.method} {original_path}] Connection error to upstream server: {e}")
-        return Response(f"Could not connect to upstream server at {TARGET_BASE_URL}: {e}",
+        return Response(f"Could not connect to upstream server at {upstream_url}: {e}",
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     except httpx.RequestError as e:
         logger.error(f"[{request.method} {original_path}] Request error to upstream server: {e}")
@@ -2439,13 +2677,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--base-path",
-        type=int,
+        type=str,
         help="Base path for the Sampling Proxy server (overrides config)",
     )    
     parser.add_argument(
         "--target-base-url",
+        action="append",
         type=str,
-        help="Base URL for the upstream server (overrides config)",
+        help="Backend URL. Can be used multiple times. Use 'name=url' to target a specific upstream (e.g., '--target-base-url local=http://host:8080/v1 --target-base-url zai=https://other/v1'). Without name, overrides the first upstream.",
     )
     parser.add_argument(
         "--debug-logs",
@@ -2482,6 +2721,11 @@ if __name__ == "__main__":
         type=str,
         help="Override parallel limits as JSON string. Example: '{\"global\": 10, \"model-name\": 2}' (overrides config)",
     )
+    parser.add_argument(
+        "--model-bindings",
+        type=str,
+        help="Override model-to-upstream bindings as JSON string. Example: '{\"glm-*\": \"zai-anthropic\", \"*\": \"local-openai\"}' (overrides config)",
+    )
 
     args = parser.parse_args()
 
@@ -2489,14 +2733,95 @@ if __name__ == "__main__":
     CONFIG = load_config(args.config)
     
     # Override global constants with command-line arguments (take precedence over config)
-    SAMPLING_PROXY_HOST = args.host if args.host is not None else CONFIG["server"]["sampling_proxy_host"]
-    SAMPLING_PROXY_PORT = args.port if args.port is not None else CONFIG["server"]["sampling_proxy_port"]
-    SAMPLING_PROXY_BASE_PATH = args.base_path if args.base_path is not None else CONFIG["server"].get("sampling_proxy_base_path", "")
-    TARGET_BASE_URL = args.target_base_url if args.target_base_url is not None else CONFIG["server"]["target_base_url"]
-    TARGET_BASE_PATH = extract_base_path(TARGET_BASE_URL)
+    listen_cfg = CONFIG.get("listen", {})
+    # Backward compat: if proxy config is empty, try server block
+    if not listen_cfg.get("host") and "server" in CONFIG:
+        listen_cfg = CONFIG["server"]
+    SAMPLING_PROXY_HOST = args.host if args.host is not None else listen_cfg.get("sampling_proxy_host", listen_cfg.get("host", "0.0.0.0"))
+    SAMPLING_PROXY_PORT = args.port if args.port is not None else listen_cfg.get("sampling_proxy_port", listen_cfg.get("port", 8001))
+    SAMPLING_PROXY_BASE_PATH = args.base_path if args.base_path is not None else listen_cfg.get("sampling_proxy_base_path", listen_cfg.get("base_path", ""))
     ENABLE_DEBUG_LOGS = args.debug_logs if args.debug_logs is not None else CONFIG["logging"]["enable_debug_logs"]
     ENABLE_OVERRIDE_LOGS = args.override_logs if args.override_logs is not None else CONFIG["logging"]["enable_override_logs"]
     ENABLE_VALIDATION_LOGS = CONFIG["logging"].get("enable_validation_logs", False)
+
+    # --- Initialize upstream pool ---
+    UPSTREAM_CONFIGS.clear()
+    UPSTREAM_CLIENTS.clear()
+    for u in CONFIG.get("upstreams", []):
+        name = u["name"]
+        base_url = u["base_url"]
+        base_path = extract_base_path(base_url)
+        UPSTREAM_CONFIGS[name] = {
+            "name": name,
+            "base_url": base_url,
+            "base_path": base_path,
+            "connect_timeout_seconds": u.get("connect_timeout_seconds", 5.0),
+            "timeout_seconds": u.get("timeout_seconds", 1200.0),
+            "supports_openai": u.get("supports_openai", True),
+            "supports_anthropic": u.get("supports_anthropic", False),
+        }
+        logger.info(f"Upstream '{name}': {base_url} (path: {base_path}, openai: {UPSTREAM_CONFIGS[name]['supports_openai']}, anthropic: {UPSTREAM_CONFIGS[name]['supports_anthropic']})")
+
+    # Handle --target-base-url CLI flag: override upstream URLs
+    # Can be specified multiple times: --target-base-url name1=url1 --target-base-url name2=url2
+    if args.target_base_url:
+        if not UPSTREAM_CONFIGS:
+            logger.warning("CLI --target-base-url ignored: no upstreams configured")
+        else:
+            first_name = next(iter(UPSTREAM_CONFIGS))
+            for entry in args.target_base_url:
+                if '=' in entry:
+                    target_name, target_url = entry.split('=', 1)
+                    target_name = target_name.strip()
+                    target_url = target_url.strip()
+                    if target_name in UPSTREAM_CONFIGS:
+                        UPSTREAM_CONFIGS[target_name]["base_url"] = target_url
+                        UPSTREAM_CONFIGS[target_name]["base_path"] = extract_base_path(target_url)
+                        logger.info(f"CLI --target-base-url overridden upstream '{target_name}' to {target_url}")
+                    else:
+                        logger.warning(f"CLI --target-base-url: upstream '{target_name}' not found, ignoring")
+                else:
+                    UPSTREAM_CONFIGS[first_name]["base_url"] = entry
+                    UPSTREAM_CONFIGS[first_name]["base_path"] = extract_base_path(entry)
+                    if len(UPSTREAM_CONFIGS) > 1:
+                        logger.info(f"CLI --target-base-url overridden first upstream '{first_name}' to {entry} (use 'name=url' to target a specific upstream)")
+                    else:
+                        logger.info(f"CLI --target-base-url overridden upstream '{first_name}' to {entry}")
+
+    # Load model-to-upstream bindings
+    MODEL_UPSTREAM_BINDING.clear()
+    for pattern, uname in CONFIG.get("model_upstream_binding", {}).items():
+        if uname not in UPSTREAM_CONFIGS:
+            logger.warning(f"Model binding '{pattern}' -> '{uname}': upstream '{uname}' not found, skipping")
+            continue
+        MODEL_UPSTREAM_BINDING[pattern] = uname
+    if MODEL_UPSTREAM_BINDING:
+        logger.info(f"Model upstream bindings: {MODEL_UPSTREAM_BINDING}")
+    else:
+        logger.warning("No model upstream bindings configured")
+
+    # CLI --model-bindings overrides config entirely
+    if args.model_bindings:
+        try:
+            parsed_bindings = json.loads(args.model_bindings)
+            if not isinstance(parsed_bindings, dict):
+                logger.warning(f"--model-bindings must be a JSON object. Ignoring: {args.model_bindings}")
+            else:
+                MODEL_UPSTREAM_BINDING.clear()
+                for pattern, uname in parsed_bindings.items():
+                    if uname not in UPSTREAM_CONFIGS:
+                        logger.warning(f"Model binding '{pattern}' -> '{uname}': upstream '{uname}' not found, skipping")
+                        continue
+                    MODEL_UPSTREAM_BINDING[pattern] = uname
+                logger.info(f"Model upstream bindings from CLI: {MODEL_UPSTREAM_BINDING}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in --model-bindings: {e}. Ignoring.")
+
+    # Legacy backward compat globals (set from first upstream for any old code paths)
+    if UPSTREAM_CONFIGS:
+        _first = next(iter(UPSTREAM_CONFIGS.values()))
+        SERVER_SUPPORTS_OPENAI = _first.get("supports_openai", True)
+        SERVER_SUPPORTS_ANTHROPIC = _first.get("supports_anthropic", False)
 
     # Load sampling parameters from config
     DEFAULT_SAMPLING_PARAMS = CONFIG["default_sampling_params"]
@@ -2506,10 +2831,6 @@ if __name__ == "__main__":
     OVERRIDE_SAMPLING_PARAMS = OVERRIDE_CONFIG.get("sampling_params", {})
     MODEL_SAMPLING_PARAMS = CONFIG["model_sampling_params"]
 
-    # Load server capabilities from server config
-    server_config = CONFIG.get("server", {})
-    SERVER_SUPPORTS_OPENAI = server_config.get("supports_openai", True)
-    SERVER_SUPPORTS_ANTHROPIC = server_config.get("supports_anthropic", False)
     VALIDATION_CONFIG = CONFIG.get("validation", {"enabled": False})
     VALIDATION_CONFIG["enable_validation_logs"] = ENABLE_VALIDATION_LOGS
     logger.info(f"Validation config loaded: enabled={VALIDATION_CONFIG.get('enabled')}, mid_stream_enabled={VALIDATION_CONFIG.get('mid_stream_validation_enabled')}")
@@ -2591,8 +2912,8 @@ if __name__ == "__main__":
             raise
 
     logger.info(f"Starting Sampling Proxy server on http://{SAMPLING_PROXY_HOST}:{SAMPLING_PROXY_PORT}")
-    logger.info(f"Proxying requests to upstream server at {TARGET_BASE_URL}")
-    logger.info(f"Server capabilities: OpenAI={SERVER_SUPPORTS_OPENAI}, Anthropic={SERVER_SUPPORTS_ANTHROPIC}")
+    for name, cfg in UPSTREAM_CONFIGS.items():
+        logger.info(f"  upstream '{name}': {cfg['base_url']}")
     logger.info(f"Debug logs are {'ENABLED' if ENABLE_DEBUG_LOGS else 'DISABLED'}.")
     logger.info(f"Override logs are {'ENABLED' if ENABLE_OVERRIDE_LOGS else 'DISABLED'}.")
     logger.info(f"Validation logs are {'ENABLED' if ENABLE_VALIDATION_LOGS else 'DISABLED'}.")
