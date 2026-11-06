@@ -73,12 +73,12 @@ class ThrottleManager:
         - Key present with None: explicitly disable this timer
         - Key absent: fall back to global config
         """
-        model_lower = model.lower()
+        model_lower = (model or "global").lower()
 
         async with self.lock:
             if model_lower not in self.model_state:
                 # Get config for this model
-                per_model_config = self.per_model_config.get(model, self.per_model_config.get(model_lower, {}))
+                per_model_config = self.per_model_config.get(model or "global", self.per_model_config.get(model_lower, {}))
 
                 start_pause = per_model_config.get("start_pause_seconds", self._UNSET)
                 if start_pause is self._UNSET:

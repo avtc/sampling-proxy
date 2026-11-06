@@ -127,3 +127,12 @@ def test_throttle_config_validation_per_model():
     }
     with pytest.raises(ValueError, match="per_model.test-model.start_pause_seconds must be >= 0"):
         ThrottleManager(config)
+
+@pytest.mark.asyncio
+async def test_wait_with_none_model_does_not_raise():
+    """Model-less requests (no model in body) must not crash the throttle manager."""
+    manager = ThrottleManager({"enabled": True, "global": {"start_pause_seconds": 0.05, "end_pause_seconds": 0.05}})
+    await manager.wait_before_send(None)  # must not raise
+    await manager.wait_after_send(None)   # must not raise
+    # A 'global' throttle state is created instead
+    assert "global" in manager.model_state
