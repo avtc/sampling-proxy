@@ -1,4 +1,6 @@
 import os
+import re
+import time
 import json
 import logging
 import httpx
@@ -34,6 +36,71 @@ def get_request_id():
 def log_info(request_id: int, message: str):
     """Log info with request ID prefix."""
     logger.info("[R:%s] %s", request_id, message)
+
+
+def _format_exception(exc: BaseException) -> str:
+    """Exception description for logs: include the type when the message is empty
+    (e.g. httpx.ConnectError from an unreachable host has no message)."""
+    msg = str(exc)
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+def _sanitize_accept_encoding(headers: dict) -> None:
+    """Restrict accept-encoding to formats httpx transparently decompresses (gzip/deflate/identity).
+
+    If a client offers br/zstd, the upstream may return a compressed body httpx cannot decode;
+    since the proxy strips content-encoding from forwarded responses, the client would receive
+    compressed bytes labeled as uncompressed. Rewriting the header prevents that.
+    """
+    ae = headers.get("accept-encoding")
+    if not ae:
+        return
+    allowed = {"gzip", "x-gzip", "deflate", "identity"}
+    tokens = [t.strip() for t in ae.split(",") if t.strip().lower().split(";", 1)[0] in allowed]
+    headers["accept-encoding"] = ", ".join(tokens) if tokens else "gzip, deflate"
+
+
+def _redact_headers(headers: dict) -> dict:
+    """Copy headers with credential values masked, for debug logging."""
+    sensitive = {"authorization", "x-api-key", "api-key", "cookie"}
+    out = {}
+    for k, v in dict(headers).items():
+        if k.lower() in sensitive and isinstance(v, str) and v:
+            out[k] = (v[:12] + "...") if len(v) > 12 else "***"
+        else:
+            out[k] = v
+    return out
+
+
+def log_upstream_error(request_id: int, upstream_name, response, include_body: bool = True):
+    """Log upstream error details for non-2xx responses: status, error body, and
+    ratelimit/retry headers (distinguishes a plan usage limit from capacity throttling)."""
+    try:
+        rl_headers = {
+            k: v for k, v in response.headers.items()
+            if k.lower().startswith("anthropic-ratelimit") or k.lower() in ("retry-after", "x-should-retry")
+        }
+    except Exception:
+        rl_headers = {}
+    parts = [f"Upstream '{upstream_name}' returned {response.status_code}"]
+    if include_body:
+        try:
+            response.content.decode("utf-8")  # strict: detect compressed/binary bodies
+            parts.append(response.text[:500].strip())
+        except (UnicodeDecodeError, AttributeError, Exception):
+            try:
+                size = len(response.content)
+            except Exception:
+                size = "?"
+            parts.append(
+                f"<binary {size} bytes, content-encoding={response.headers.get('content-encoding', 'unknown')} — "
+                f"not decodable; if this persists, ensure accept-encoding is sanitized>"
+            )
+    else:
+        parts.append("(streaming; body forwarded to client)")
+    if rl_headers:
+        parts.append(f"| {rl_headers}")
+    log_info(request_id, " ".join(parts))
 
 # Import validator module for garbage detection
 from validator import (
@@ -98,6 +165,12 @@ def load_config(config_path="config.json"):
             "mid_stream_validation_interval_words": 300
         },
         "parallel_limits": {},
+        "models_endpoint": {
+            "enabled": True,
+            "cache_ttl_seconds": 300,
+            "include_binding_models": True,
+            "extra_models": []
+        },
         "throttle": {
             "enabled": False,
             "global": {
@@ -254,8 +327,20 @@ MODEL_SAMPLING_PARAMS = {}
 UPSTREAM_CONFIGS: dict = {}
 # Per-upstream httpx clients: name -> httpx.AsyncClient
 UPSTREAM_CLIENTS: dict = {}
-# Model-to-upstream binding: pattern -> upstream_name (supports glob patterns)
+# Model-to-upstream binding: pattern -> upstream name or alias object (supports glob patterns)
+# Alias object form: {"upstream": "<name>", "model": "<upstream model id>"} — routes to the
+# upstream and rewrites the request's model name before forwarding.
 MODEL_UPSTREAM_BINDING: dict = {}
+
+# Aggregated models endpoint config (gateway model discovery, e.g. Claude Code /v1/models)
+MODELS_ENDPOINT_CONFIG: dict = {
+    "enabled": True,
+    "cache_ttl_seconds": 300,
+    "include_binding_models": True,
+    "extra_models": [],
+}
+_MODELS_CACHE: dict = {"fetched_at": 0.0, "models": [], "refreshing": False}
+_MODELS_CACHE_LOCK = asyncio.Lock()
 
 # Server capability configuration — DEPRECATED, kept for backward compat within handler
 # Replaced by per-upstream lookups
@@ -293,6 +378,34 @@ ANTHROPIC_ENDPOINTS = [
 # Global variable to store the first available model name from /models to be used for anthropic requests
 FIRST_AVAILABLE_MODEL = "any" # sglang allows any model name, vllm require exact match
 
+def binding_upstream_name(binding) -> Optional[str]:
+    """Extract the upstream name from a binding value (plain string or alias object)."""
+    if isinstance(binding, dict):
+        return binding.get("upstream")
+    return binding
+
+
+def binding_model_rewrite(binding, model_name: str) -> str:
+    """Model name to send upstream: alias-object 'model' if set, else the request's name."""
+    if isinstance(binding, dict) and binding.get("model"):
+        return binding["model"]
+    return model_name
+
+
+def resolve_binding_for_model(model_name: str):
+    """Resolve the full binding value (string or alias object) for a model.
+    Exact match first, then glob patterns in config order; None if no match."""
+    if not model_name:
+        return None
+    if model_name in MODEL_UPSTREAM_BINDING:
+        return MODEL_UPSTREAM_BINDING[model_name]
+    for pattern in MODEL_UPSTREAM_BINDING.keys():
+        if is_glob_pattern(pattern):
+            if fnmatch.fnmatch(model_name, pattern):
+                return MODEL_UPSTREAM_BINDING[pattern]
+    return None
+
+
 def resolve_upstream_for_model(model_name: str) -> Optional[str]:
     """Resolve which upstream a model should route to.
     
@@ -306,14 +419,30 @@ def resolve_upstream_for_model(model_name: str) -> Optional[str]:
     
     # Exact match first
     if model_name in MODEL_UPSTREAM_BINDING:
-        return MODEL_UPSTREAM_BINDING[model_name]
+        return binding_upstream_name(MODEL_UPSTREAM_BINDING[model_name])
     
     # Then glob patterns (in config order, first match wins)
-    for pattern, upstream_name in MODEL_UPSTREAM_BINDING.items():
-        if '*' in pattern or '?' in pattern or '[' in pattern:
+    for pattern, binding in MODEL_UPSTREAM_BINDING.items():
+        if is_glob_pattern(pattern):
             if fnmatch.fnmatch(model_name, pattern):
-                return upstream_name
+                return binding_upstream_name(binding)
     
+    return None
+
+
+def resolve_anthropic_default_upstream() -> Optional[str]:
+    """Default upstream for Anthropic-format requests that carry no model to route by.
+
+    Preference order:
+    1. The wildcard "*" model binding, if it points to an Anthropic-capable upstream
+    2. The first Anthropic-capable upstream in config order
+    """
+    wildcard = binding_upstream_name(MODEL_UPSTREAM_BINDING.get("*"))
+    if wildcard and UPSTREAM_CONFIGS.get(wildcard, {}).get("supports_anthropic"):
+        return wildcard
+    for uname, ucfg in UPSTREAM_CONFIGS.items():
+        if ucfg.get("supports_anthropic"):
+            return uname
     return None
 
 
@@ -325,6 +454,267 @@ def get_upstream_config(upstream_name: str) -> Optional[dict]:
 def get_upstream_client(upstream_name: str) -> Optional[httpx.AsyncClient]:
     """Get httpx client for an upstream by name. Returns None if not found."""
     return UPSTREAM_CLIENTS.get(upstream_name)
+
+
+# --- Per-upstream authentication ---
+# Auth headers that are stripped/replaced when an upstream uses configured credentials
+AUTH_HEADERS_TO_STRIP = ["authorization", "x-api-key", "api-key"]
+
+
+def resolve_env_value(value):
+    """Expand ${VAR} or ${VAR:-default} placeholders in a string.
+
+    Unknown variables resolve to the default (or empty string when no default given).
+    Non-string values are returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+
+    def _sub(match):
+        var, default = match.group(1), match.group(3)
+        return os.environ.get(var, default if default is not None else "")
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}", _sub, value)
+
+
+def normalize_upstream_auth(auth_cfg, upstream_name: str = "upstream") -> dict:
+    """Normalize an upstream 'auth' config block.
+
+    Supported types:
+    - "passthrough" (default): forward client credentials untouched
+    - "api_key": strip client credentials, inject the configured key.
+      Fields: api_key (or token) — literal or ${ENV_VAR}; header (default "authorization");
+      scheme (default "Bearer" for authorization header, none otherwise)
+    """
+    if not auth_cfg:
+        return {"type": "passthrough"}
+
+    auth_type = auth_cfg.get("type", "passthrough")
+    if auth_type == "passthrough":
+        return {"type": "passthrough"}
+
+    if auth_type == "api_key":
+        api_key = resolve_env_value(auth_cfg.get("api_key", auth_cfg.get("token", "")))
+        header = (auth_cfg.get("header") or "authorization").lower()
+        scheme = auth_cfg.get("scheme")
+        if scheme is None:
+            scheme = "Bearer" if header == "authorization" else ""
+        if not api_key:
+            logger.warning(
+                f"Upstream '{upstream_name}': auth.type='api_key' but no api_key/token resolved "
+                f"(env var unset?). Falling back to passthrough auth."
+            )
+            return {"type": "passthrough"}
+        return {"type": "api_key", "api_key": api_key, "header": header, "scheme": str(scheme)}
+
+    logger.warning(f"Upstream '{upstream_name}': unknown auth.type '{auth_type}'. Falling back to passthrough.")
+    return {"type": "passthrough"}
+
+
+def apply_upstream_auth(headers: dict, upstream_cfg: dict) -> dict:
+    """Apply the upstream's auth policy to outgoing headers (in place).
+
+    - passthrough: forward client credentials untouched (default, previous behavior)
+    - api_key: strip client credentials and inject the configured key
+    """
+    if not upstream_cfg:
+        return headers
+    auth = upstream_cfg.get("auth") or {"type": "passthrough"}
+    if auth.get("type") != "api_key":
+        return headers
+
+    for h in AUTH_HEADERS_TO_STRIP:
+        headers.pop(h, None)
+        headers.pop(h.upper(), None)
+        headers.pop(h.title(), None)
+
+    header = auth.get("header", "authorization")
+    scheme = auth.get("scheme", "")
+    headers[header] = f"{scheme} {auth['api_key']}" if scheme else auth["api_key"]
+    return headers
+
+
+def get_auth_headers(upstream_cfg: dict, incoming_headers: Optional[dict] = None) -> dict:
+    """Build auth headers for a proxy-initiated request (e.g. model list polling).
+
+    Starts from the client's credentials (so passthrough upstreams keep working),
+    then applies the upstream's auth policy on top.
+    """
+    base = {"accept": "application/json"}
+    if incoming_headers:
+        # Forward credentials (for passthrough upstreams) plus the Anthropic headers that
+        # OAuth subscription tokens require on /v1/models polls.
+        for h in AUTH_HEADERS_TO_STRIP + ["anthropic-beta", "anthropic-version"]:
+            if h in incoming_headers:
+                base[h] = incoming_headers[h]
+    return apply_upstream_auth(base, upstream_cfg)
+
+
+# --- Aggregated /v1/models endpoint (gateway model discovery) ---
+
+def is_glob_pattern(pattern: str) -> bool:
+    """True if a model binding pattern contains glob characters."""
+    return '*' in pattern or '?' in pattern or '[' in pattern
+
+
+def _models_path_for_upstream(cfg: dict) -> Optional[str]:
+    """Path to list models on an upstream, or None if it supports neither format."""
+    if cfg.get("supports_anthropic"):
+        # Anthropic-format API always exposes /v1/messages-style routes, so /v1/models
+        return "/v1/models"
+    if cfg.get("supports_openai"):
+        # If base_url already carries a path (e.g. .../v1), append /models; else use /v1/models
+        return "/models" if cfg.get("base_path") else "/v1/models"
+    return None
+
+
+def _extract_model_entries(payload) -> list:
+    """Extract model entries from an upstream /models response.
+
+    Handles OpenAI/Anthropic style ({"data": [...]}) and llama.cpp style ({"models": [...]}).
+    """
+    entries = []
+    if isinstance(payload, dict):
+        raw = payload.get("data") or payload.get("models") or []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and item.get("id"):
+                    entry = {
+                        "type": item.get("type", "model"),
+                        "id": str(item["id"]),
+                        "display_name": str(item.get("display_name") or item["id"]),
+                    }
+                    if item.get("description"):
+                        entry["description"] = str(item["description"])
+                    entries.append(entry)
+                elif isinstance(item, str) and item:
+                    entries.append({"type": "model", "id": item, "display_name": item})
+    return entries
+
+
+def _binding_model_entries() -> list:
+    """Literal (non-glob) model names from model_upstream_binding — always routable via the proxy."""
+    return [
+        {
+            "type": "model",
+            "id": pattern,
+            "display_name": pattern,
+            "description": f"via {binding_upstream_name(binding) or 'unknown'} upstream",
+        }
+        for pattern, binding in MODEL_UPSTREAM_BINDING.items()
+        if not is_glob_pattern(pattern)
+    ]
+
+
+def build_models_response_payload(models: list) -> dict:
+    """Build an Anthropic-style List Models response payload."""
+    return {
+        "data": models,
+        "first_id": models[0]["id"] if models else None,
+        "has_more": False,
+        "last_id": models[-1]["id"] if models else None,
+        "last_error": None,
+    }
+
+
+async def fetch_upstream_models(upstream_name: str, cfg: dict, incoming_headers: Optional[dict] = None) -> list:
+    """Fetch the model list from a single upstream. Raises on HTTP errors.
+
+    Uses a short timeout: Claude Code's model discovery gives the gateway ~3 seconds total,
+    so upstream polls must never block the response path for long.
+    Skipped entirely (returns []) when the upstream sets poll_models=false.
+    """
+    if not cfg.get("poll_models", True):
+        return []
+    client = UPSTREAM_CLIENTS.get(upstream_name)
+    models_path = _models_path_for_upstream(cfg)
+    if client is None or models_path is None:
+        return []
+    headers = get_auth_headers(cfg, incoming_headers)
+    params = {"limit": 1000} if cfg.get("supports_anthropic") else None
+    response = await client.get(models_path, headers=headers, timeout=2.5, params=params)
+    if response.status_code != 200:
+        raise RuntimeError(f"status {response.status_code}")
+    return _extract_model_entries(response.json())
+
+
+async def _poll_all_upstreams(incoming_headers: Optional[dict] = None) -> list:
+    """Poll every upstream and merge binding literals + discovered + extra models (deduped)."""
+    models = []
+    seen = set()
+
+    def _add(entries):
+        for entry in entries:
+            if entry["id"] not in seen:
+                seen.add(entry["id"])
+                models.append(entry)
+
+    if MODELS_ENDPOINT_CONFIG.get("include_binding_models", True):
+        _add(_binding_model_entries())
+
+    results = await asyncio.gather(
+        *[fetch_upstream_models(name, cfg, incoming_headers) for name, cfg in UPSTREAM_CONFIGS.items()],
+        return_exceptions=True,
+    )
+    for (name, _cfg), result in zip(UPSTREAM_CONFIGS.items(), results):
+        if isinstance(result, BaseException):
+            logger.warning(f"Models endpoint: failed to list models from upstream '{name}': {_format_exception(result)}")
+        else:
+            _add(result)
+
+    for extra in MODELS_ENDPOINT_CONFIG.get("extra_models", []) or []:
+        _add([{"type": "model", "id": str(extra), "display_name": str(extra)}])
+
+    return models
+
+
+async def _refresh_models_cache_in_background(incoming_headers: Optional[dict] = None):
+    """Re-poll all upstreams and update the cache. Runs as a background task;
+    guarded so only one refresh runs at a time."""
+    if _MODELS_CACHE.get("refreshing"):
+        return
+    _MODELS_CACHE["refreshing"] = True
+    try:
+        try:
+            models = await _poll_all_upstreams(incoming_headers)
+            if models:
+                _MODELS_CACHE["models"] = models
+                _MODELS_CACHE["fetched_at"] = time.monotonic()
+        except Exception as e:
+            logger.warning(f"Models endpoint: background refresh failed: {_format_exception(e)}")
+    finally:
+        _MODELS_CACHE["refreshing"] = False
+
+
+async def aggregate_models(incoming_headers: Optional[dict] = None) -> dict:
+    """Aggregate the model list across all upstreams plus literal model bindings.
+
+    Fast path first: a fresh cache is served immediately; a stale cache is served
+    instantly while a background refresh runs (Claude Code's discovery request has a
+    ~3 second timeout and treats a slow response as failure). Only a completely cold
+    cache polls upstreams synchronously.
+    """
+    async with _MODELS_CACHE_LOCK:
+        ttl = float(MODELS_ENDPOINT_CONFIG.get("cache_ttl_seconds", 300) or 0)
+        now = time.monotonic()
+        cached = _MODELS_CACHE["models"]
+
+        if cached and ttl > 0 and (now - _MODELS_CACHE["fetched_at"]) < ttl:
+            return build_models_response_payload(cached)
+
+        if cached:
+            # Stale but present: serve instantly, refresh in the background
+            asyncio.create_task(_refresh_models_cache_in_background(incoming_headers))
+            return build_models_response_payload(cached)
+
+        # Cold cache: poll synchronously (binding literals guarantee a usable list
+        # even when every upstream is unreachable)
+        models = await _poll_all_upstreams(incoming_headers)
+        if not models and cached:
+            models = cached
+        _MODELS_CACHE["models"] = models
+        _MODELS_CACHE["fetched_at"] = now
+        return build_models_response_payload(models)
 
 def get_model_semaphore(model_name: str):
     """Get the semaphore for a model if a parallel limit is configured. Returns None if no limit."""
@@ -371,11 +761,13 @@ async def lifespan(app: FastAPI):
         )
 
     # Poll /models to get the first available model from the first OpenAI-capable upstream
-    # Skip if: 1) no upstream supports OpenAI, or 2) override model already configured
+    # (used only as the fallback model for Anthropic->OpenAI conversion mode)
+    # Skip if: 1) no upstream supports OpenAI, 2) override model already configured,
+    # or 3) every OpenAI-capable upstream has poll_models disabled
     if not OVERRIDE_MODEL_NAME:
         openai_upstream = None
         for name, cfg in UPSTREAM_CONFIGS.items():
-            if cfg.get("supports_openai"):
+            if cfg.get("supports_openai") and cfg.get("poll_models", True):
                 openai_upstream = (name, cfg)
                 break
         
@@ -387,7 +779,8 @@ async def lifespan(app: FastAPI):
             
             try:
                 logger.info(f"Polling {upstream_cfg['base_url']}{models_path} to get available models...")
-                response = await upstream_client.get(models_path)
+                poll_headers = get_auth_headers(upstream_cfg)
+                response = await upstream_client.get(models_path, headers=poll_headers, timeout=15.0)
                 if response.status_code == 200:
                     models_data = response.json()
                     if "data" in models_data and len(models_data["data"]) > 0:
@@ -398,10 +791,16 @@ async def lifespan(app: FastAPI):
                 else:
                     logger.warning(f"Failed to get models from {models_path}. Status: {response.status_code}")
             except Exception as e:
-                logger.warning(f"Error polling {models_path}: {e}")
+                logger.warning(f"Error polling {upstream_cfg['base_url']}{models_path}: {_format_exception(e)}")
     elif OVERRIDE_MODEL_NAME:
         FIRST_AVAILABLE_MODEL = OVERRIDE_MODEL_NAME
         logger.info(f"Using override model name: {FIRST_AVAILABLE_MODEL}")
+    
+    # Warm the aggregated models cache so the first gateway discovery request
+    # (Claude Code gives it ~3 seconds) is served instantly from cache
+    if MODELS_ENDPOINT_CONFIG.get("enabled", True):
+        asyncio.create_task(_refresh_models_cache_in_background())
+    
     
     yield # Application starts here
     logger.info("FastAPI application shutdown.")
@@ -440,6 +839,10 @@ async def read_root():
         "model_sampling_params_configured": list(MODEL_SAMPLING_PARAMS.keys()),
         "generation_endpoints_monitored": GENERATION_ENDPOINT_SUFFIXES,
         "anthropic_endpoints_handled_locally": ANTHROPIC_ENDPOINTS,
+        "models_endpoint": {
+            "enabled": MODELS_ENDPOINT_CONFIG.get("enabled"),
+            "cached_model_count": len(_MODELS_CACHE["models"]),
+        },
         "debug_logs_enabled": ENABLE_DEBUG_LOGS,
         "parallel_limits": {**({"global": GLOBAL_LIMIT} if GLOBAL_LIMIT is not None else {}), **PARALLEL_LIMITS},
     }
@@ -764,6 +1167,27 @@ async def proxy_target_requests(path: str, request: Request):
     if ENABLE_DEBUG_LOGS:
         logger.debug(f"Normalized path for matching: '{path}' (Original: '{original_path}')")
 
+    # --- Claude Code gateway connectivity probe (keyless; answer 200 like api.anthropic.com) ---
+    if request.method in ("GET", "HEAD") and (path == "api/hello" or path.endswith("/api/hello")):
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type="application/json")
+        return Response(content=json.dumps({"message": "hello"}), status_code=200, media_type="application/json")
+
+    # --- Aggregated models endpoint (gateway model discovery, e.g. Claude Code) ---
+    if (request.method == "GET" and MODELS_ENDPOINT_CONFIG.get("enabled", True)
+            and (path == "models" or path.endswith("/models"))):
+        incoming_auth = {h: request.headers[h] for h in AUTH_HEADERS_TO_STRIP if h in request.headers}
+        try:
+            payload = await aggregate_models(incoming_auth)
+            return Response(content=json.dumps(payload), status_code=200, media_type="application/json")
+        except Exception as e:
+            logger.error(f"Models endpoint: failed to aggregate models: {e}")
+            return Response(
+                content=json.dumps({"error": {"type": "api_error", "message": f"Failed to aggregate models: {e}"}}),
+                status_code=502,
+                media_type="application/json",
+            )
+
     # Handle Anthropic-specific endpoints
     if path in ANTHROPIC_ENDPOINTS:
         # Determine which upstream to use:
@@ -771,6 +1195,7 @@ async def proxy_target_requests(path: str, request: Request):
         # - event_logging: no model field, use first Anthropic-capable upstream
         au_name = None
         au_model = None
+        au_rewrite = None
 
         if path == "v1/messages/count_tokens":
             try:
@@ -778,23 +1203,20 @@ async def proxy_target_requests(path: str, request: Request):
                 body_json = json.loads(raw)
                 au_model = body_json.get("model")
                 if au_model:
-                    au_name = resolve_upstream_for_model(au_model)
+                    _binding = resolve_binding_for_model(au_model)
+                    if _binding is not None:
+                        au_name = binding_upstream_name(_binding)
+                        au_rewrite = binding_model_rewrite(_binding, au_model)
             except (json.JSONDecodeError, Exception):
                 pass
             if au_name is None:
-                # Fall back to first Anthropic-capable upstream
-                for uname, ucfg in UPSTREAM_CONFIGS.items():
-                    if ucfg.get("supports_anthropic"):
-                        au_name = uname
-                        break
+                # Fall back to wildcard binding, then first Anthropic-capable upstream
+                au_name = resolve_anthropic_default_upstream()
 
             # Re-read body (await request.body() caches, so it's fine)
         else:
             # event_logging — no model to route by
-            for uname, ucfg in UPSTREAM_CONFIGS.items():
-                if ucfg.get("supports_anthropic"):
-                    au_name = uname
-                    break
+            au_name = resolve_anthropic_default_upstream()
 
         if au_name:
             au_cfg = UPSTREAM_CONFIGS[au_name]
@@ -810,7 +1232,18 @@ async def proxy_target_requests(path: str, request: Request):
             passthrough_headers = dict(request.headers)
             passthrough_headers.pop("host", None)
             passthrough_headers.pop("content-length", None)
+            # Apply per-upstream auth policy (strip client creds / inject configured key)
+            apply_upstream_auth(passthrough_headers, au_cfg)
+            _sanitize_accept_encoding(passthrough_headers)
             passthrough_body = await request.body()
+            if ENABLE_DEBUG_LOGS:
+                logger.debug(f"Final outgoing headers for upstream '{au_name}' (auth applied): {_redact_headers(passthrough_headers)}")
+            # Rewrite aliased model name to the upstream's real model id
+            if au_rewrite and au_rewrite != au_model:
+                try:
+                    passthrough_body = json.dumps({**json.loads(passthrough_body), "model": au_rewrite}).encode()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
 
             # Strip upstream base path to avoid doubling it (httpx client has base_url set)
             if au_base_path and target_path.startswith(au_base_path):
@@ -960,14 +1393,16 @@ async def proxy_target_requests(path: str, request: Request):
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None) # httpx will recalculate if body changes
+    _sanitize_accept_encoding(headers)  # keep only encodings httpx can transparently decompress
     if ENABLE_DEBUG_LOGS:
-        logger.debug(f"Outgoing Request Headers (initial): {headers}")
+        logger.debug(f"Outgoing Request Headers (initial): {_redact_headers(headers)}")
 
     request_content = None # This will hold the request body to be sent to target
     is_generation_request = False
     is_anthropic_request = False # Initialize Anthropic request flag
     incoming_json_body = {} # Initialize in case it's not a POST/JSON request
     model_name = None  # Model name extracted from request
+    routed_model_name = None  # Rewritten model name for the upstream (alias bindings)
 
     # Determine if the current request path is a recognized generation endpoint
     # Use suffix matching to handle paths with or without v1 prefix
@@ -987,6 +1422,18 @@ async def proxy_target_requests(path: str, request: Request):
     def _resolve_upstream_now():
         """Resolve upstream for non-generation or non-POST requests based on path format."""
         nonlocal upstream_name, upstream_cfg, upstream_client
+        # Explicit wildcard binding ("*": ...) is the default upstream for requests that
+        # carry no model to route by — but only when it supports the request's format.
+        wildcard_upstream = binding_upstream_name(MODEL_UPSTREAM_BINDING.get("*"))
+        if wildcard_upstream and wildcard_upstream in UPSTREAM_CONFIGS:
+            wildcard_cfg = UPSTREAM_CONFIGS[wildcard_upstream]
+            if (is_anthropic_request and wildcard_cfg.get("supports_anthropic")) or (
+                not is_anthropic_request and wildcard_cfg.get("supports_openai")
+            ):
+                upstream_name = wildcard_upstream
+                upstream_cfg = wildcard_cfg
+                upstream_client = UPSTREAM_CLIENTS[wildcard_upstream]
+                return
         if is_anthropic_request:
             for uname, ucfg in UPSTREAM_CONFIGS.items():
                 if ucfg.get("supports_anthropic"):
@@ -1010,6 +1457,8 @@ async def proxy_target_requests(path: str, request: Request):
 
     if not (is_generation_request and request.method == "POST"):
         _resolve_upstream_now()
+        if ENABLE_DEBUG_LOGS and upstream_name:
+            logger.debug(f"Resolved path '{path}' to upstream '{upstream_name}' (non-generation request)")
 
     # For generation POST requests, upstream is resolved after parsing model name (below).
     # For now, check if we even have any upstreams for non-generation paths.
@@ -1097,13 +1546,18 @@ async def proxy_target_requests(path: str, request: Request):
             # --- Resolve upstream based on model name ---
             _raw_model = incoming_json_body.get("model")
             if _raw_model:
-                _resolved = resolve_upstream_for_model(_raw_model)
-                if _resolved:
+                _resolved_binding = resolve_binding_for_model(_raw_model)
+                if _resolved_binding is not None:
+                    _resolved = binding_upstream_name(_resolved_binding)
+                    routed_model_name = binding_model_rewrite(_resolved_binding, _raw_model)
                     upstream_name = _resolved
                     upstream_cfg = UPSTREAM_CONFIGS[_resolved]
                     upstream_client = UPSTREAM_CLIENTS[_resolved]
                     if ENABLE_DEBUG_LOGS:
-                        logger.debug(f"Resolved model '{_raw_model}' -> upstream '{_resolved}'")
+                        logger.debug(
+                            f"Resolved model '{_raw_model}' -> upstream '{_resolved}'"
+                            + (f" (rewritten to '{routed_model_name}')" if routed_model_name != _raw_model else "")
+                        )
                 else:
                     # No binding found — error
                     return Response(
@@ -1515,6 +1969,13 @@ async def proxy_target_requests(path: str, request: Request):
                 incoming_json_body["sampling_params"] = current_params_container
             # If not nested, they are already updated in incoming_json_body
 
+            # Apply per-binding model rewrite (alias -> upstream model id).
+            # Takes precedence over the global override.model_name.
+            if routed_model_name and routed_model_name != incoming_json_body.get("model"):
+                if ENABLE_OVERRIDE_LOGS:
+                    logger.info(f"ROUTING: model '{incoming_json_body.get('model')}' rewritten to '{routed_model_name}' for upstream '{upstream_name}'")
+                incoming_json_body["model"] = routed_model_name
+
             request_content = json.dumps(incoming_json_body) # Serialize the modified JSON back to a string
             headers["content-type"] = "application/json" # Ensure content-type header is correct
 
@@ -1532,6 +1993,15 @@ async def proxy_target_requests(path: str, request: Request):
         if ENABLE_DEBUG_LOGS:
             logger.debug(f"Not a POST generation request (is_generation_request={is_generation_request}, method={request.method}). Proxying raw body without modification.")
         request_content = await request.body()
+
+    # --- Apply per-upstream authentication ---
+    # At this point the final upstream is resolved (for both generation and
+    # non-generation requests), so apply its auth policy once to the outgoing headers.
+    # All forwarding paths below share this same `headers` dict.
+    if upstream_cfg is not None:
+        apply_upstream_auth(headers, upstream_cfg)
+        if ENABLE_DEBUG_LOGS:
+            logger.debug(f"Final outgoing headers for upstream '{upstream_name}' (auth applied): {_redact_headers(headers)}")
 
     # --- Parallel Limit Semaphores ---
     # Acquire both global and model-specific semaphores if configured.
@@ -1601,7 +2071,7 @@ async def proxy_target_requests(path: str, request: Request):
             # Log request start with attempt info
             max_retries = VALIDATION_CONFIG.get("max_retries", 3)
             max_attempts = 1 + max_retries
-            log_info(request_id, f"Request started")
+            log_info(request_id, f"Request started: model='{model_name}', stream={is_streaming_request}, path='/{original_path}'")
 
             if ENABLE_DEBUG_LOGS:
                 logger.debug(f"Sending {'streaming' if is_streaming_request else 'non-streaming'} request.")
@@ -1619,6 +2089,8 @@ async def proxy_target_requests(path: str, request: Request):
                 if throttle_manager:
                     await throttle_manager.wait_before_send(model_name, request_id)
                 target_response = await upstream_client.send(target_request_obj, stream=True)
+                if target_response.status_code >= 400:
+                    log_upstream_error(request_id, upstream_name, target_response, include_body=False)
             else:
                 # For non-streaming requests, fetch the full response
                 if throttle_manager:
@@ -2411,6 +2883,8 @@ async def proxy_target_requests(path: str, request: Request):
                     logger.debug(f"Upstream Response Headers (full): {target_response.headers}")
                     logger.debug(f"Upstream Response Status: {target_response.status_code}")
                     logger.debug(f"Upstream Response Content: {target_response.text}")
+                if target_response.status_code >= 400:
+                    log_upstream_error(request_id, upstream_name, target_response)
                 
                 # Handle Anthropic response conversion for non-streaming requests
                 response_content = target_response.content
@@ -2759,8 +3233,13 @@ if __name__ == "__main__":
             "timeout_seconds": u.get("timeout_seconds", 1200.0),
             "supports_openai": u.get("supports_openai", True),
             "supports_anthropic": u.get("supports_anthropic", False),
+            "auth": normalize_upstream_auth(u.get("auth"), name),
+            "poll_models": u.get("poll_models", True),
         }
-        logger.info(f"Upstream '{name}': {base_url} (path: {base_path}, openai: {UPSTREAM_CONFIGS[name]['supports_openai']}, anthropic: {UPSTREAM_CONFIGS[name]['supports_anthropic']})")
+        auth = UPSTREAM_CONFIGS[name]["auth"]
+        auth_desc = "passthrough" if auth["type"] == "passthrough" else f"api_key via '{auth['header']}' header"
+        poll_desc = "" if UPSTREAM_CONFIGS[name]["poll_models"] else ", models_poll: OFF"
+        logger.info(f"Upstream '{name}': {base_url} (path: {base_path}, openai: {UPSTREAM_CONFIGS[name]['supports_openai']}, anthropic: {UPSTREAM_CONFIGS[name]['supports_anthropic']}, auth: {auth_desc}{poll_desc})")
 
     # Handle --target-base-url CLI flag: override upstream URLs
     # Can be specified multiple times: --target-base-url name1=url1 --target-base-url name2=url2
@@ -2788,13 +3267,14 @@ if __name__ == "__main__":
                     else:
                         logger.info(f"CLI --target-base-url overridden upstream '{first_name}' to {entry}")
 
-    # Load model-to-upstream bindings
+    # Load model-to-upstream bindings (values may be upstream names or alias objects)
     MODEL_UPSTREAM_BINDING.clear()
-    for pattern, uname in CONFIG.get("model_upstream_binding", {}).items():
+    for pattern, binding in CONFIG.get("model_upstream_binding", {}).items():
+        uname = binding_upstream_name(binding)
         if uname not in UPSTREAM_CONFIGS:
             logger.warning(f"Model binding '{pattern}' -> '{uname}': upstream '{uname}' not found, skipping")
             continue
-        MODEL_UPSTREAM_BINDING[pattern] = uname
+        MODEL_UPSTREAM_BINDING[pattern] = binding
     if MODEL_UPSTREAM_BINDING:
         logger.info(f"Model upstream bindings: {MODEL_UPSTREAM_BINDING}")
     else:
@@ -2808,11 +3288,12 @@ if __name__ == "__main__":
                 logger.warning(f"--model-bindings must be a JSON object. Ignoring: {args.model_bindings}")
             else:
                 MODEL_UPSTREAM_BINDING.clear()
-                for pattern, uname in parsed_bindings.items():
+                for pattern, binding in parsed_bindings.items():
+                    uname = binding_upstream_name(binding)
                     if uname not in UPSTREAM_CONFIGS:
                         logger.warning(f"Model binding '{pattern}' -> '{uname}': upstream '{uname}' not found, skipping")
                         continue
-                    MODEL_UPSTREAM_BINDING[pattern] = uname
+                    MODEL_UPSTREAM_BINDING[pattern] = binding
                 logger.info(f"Model upstream bindings from CLI: {MODEL_UPSTREAM_BINDING}")
         except json.JSONDecodeError as e:
             logger.warning(f"Invalid JSON in --model-bindings: {e}. Ignoring.")
@@ -2838,6 +3319,22 @@ if __name__ == "__main__":
     # Load throttle configuration
     THROTTLE_CONFIG = CONFIG.get("throttle", {"enabled": False})
     logger.info(f"Throttle config loaded: enabled={THROTTLE_CONFIG.get('enabled')}")
+
+    # Load aggregated models endpoint configuration (gateway model discovery)
+    models_cfg = CONFIG.get("models_endpoint", {}) or {}
+    MODELS_ENDPOINT_CONFIG.update({
+        "enabled": models_cfg.get("enabled", True),
+        "cache_ttl_seconds": models_cfg.get("cache_ttl_seconds", 300),
+        "include_binding_models": models_cfg.get("include_binding_models", True),
+        "extra_models": models_cfg.get("extra_models", []),
+    })
+    _MODELS_CACHE["models"] = []
+    _MODELS_CACHE["fetched_at"] = 0.0
+    logger.info(
+        f"Models endpoint config loaded: enabled={MODELS_ENDPOINT_CONFIG['enabled']}, "
+        f"cache_ttl={MODELS_ENDPOINT_CONFIG['cache_ttl_seconds']}s, "
+        f"include_bindings={MODELS_ENDPOINT_CONFIG['include_binding_models']}"
+    )
 
     # Parse override parameters from command line if provided (takes precedence over config)
     if args.override_sampling_params:

@@ -11,7 +11,13 @@
       "connect_timeout_seconds": 5.0,
       "timeout_seconds": 1200.0,
       "supports_openai": true,
-      "supports_anthropic": false
+      "supports_anthropic": false,
+      "auth": {
+        "type": "api_key",
+        "api_key": "${LOCAL_API_KEY}",
+        "header": "authorization",
+        "scheme": "Bearer"
+      }
     },
     {
       "name": "zai-anthropic",
@@ -19,11 +25,31 @@
       "connect_timeout_seconds": 5.0,
       "timeout_seconds": 1200.0,
       "supports_openai": false,
-      "supports_anthropic": true
+      "supports_anthropic": true,
+      "auth": {
+        "type": "api_key",
+        "api_key": "${ZAI_API_KEY}",
+        "header": "authorization",
+        "scheme": "Bearer"
+      }
+    },
+    {
+      "name": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "connect_timeout_seconds": 5.0,
+      "timeout_seconds": 1200.0,
+      "supports_openai": false,
+      "supports_anthropic": true,
+      "auth": {
+        "type": "passthrough"
+      },
+      "poll_models": false
     }
   ],
   "model_upstream_binding": {
+    "anthropic/glm-4.7": { "upstream": "zai-anthropic", "model": "glm-4.7" },
     "glm-*": "zai-anthropic",
+    "claude-*": "anthropic",
     "*": "local-openai"
   },
   "logging": {
@@ -76,6 +102,12 @@
   "parallel_limits": {
     "global": 999,
     "example-model": 2
+  },
+  "models_endpoint": {
+    "enabled": true,
+    "cache_ttl_seconds": 300,
+    "include_binding_models": true,
+    "extra_models": []
   },
   "throttle": {
     "enabled": false,
